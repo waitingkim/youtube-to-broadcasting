@@ -766,6 +766,112 @@ static void yt_save(void *data, obs_data_t *settings)
 	pthread_mutex_unlock(&s->mutex);
 }
 
+
+/* --- procedures for UIs (youtube-playlist-ui dock) ------------------------ */
+
+static const char *state_name(enum obs_media_state st)
+{
+	switch (st) {
+	case OBS_MEDIA_STATE_PLAYING:
+		return "playing";
+	case OBS_MEDIA_STATE_OPENING:
+		return "opening";
+	case OBS_MEDIA_STATE_BUFFERING:
+		return "buffering";
+	case OBS_MEDIA_STATE_PAUSED:
+		return "paused";
+	case OBS_MEDIA_STATE_STOPPED:
+		return "stopped";
+	case OBS_MEDIA_STATE_ENDED:
+		return "ended";
+	case OBS_MEDIA_STATE_ERROR:
+		return "error";
+	default:
+		return "none";
+	}
+}
+
+/* void get_queue(out string json)
+ * {"state": "...", "current": <index or -1>,
+ *  "items": [{"entry", "title", "duration", "status", "progress"}]} */
+static void proc_get_queue(void *data, calldata_t *cd)
+{
+	struct yt_source *s = data;
+	obs_data_t *root = obs_data_create();
+	obs_data_array_t *arr = obs_data_array_create();
+
+	pthread_mutex_lock(&s->mutex);
+	enum obs_media_state st = s->state;
+	if (st == OBS_MEDIA_STATE_PLAYING && s->waiting)
+		st = OBS_MEDIA_STATE_BUFFERING;
+	obs_data_set_string(root, "state", state_name(st));
+	obs_data_set_int(root, "current", s->cur >= 0 ? (long long)s->cur_index : -1);
+	obs_data_set_bool(root, "lists_pending", s->lists_pending);
+
+	for (size_t i = 0; i < s->items.num; i++) {
+		const char *entry = s->items.array[i];
+		obs_data_t *item = obs_data_create();
+		obs_data_set_string(item, "entry", entry);
+
+		const char *status = "";
+		if (!yt_fetcher_is_remote(entry)) {
+			const char *slash = strrchr(entry, '/');
+			obs_data_set_string(item, "title", slash ? slash + 1 : entry);
+			status = "local";
+		} else {
+			struct yt_item_info info;
+			yt_fetcher_peek(entry, &info);
+			obs_data_set_string(item, "title", info.title[0] ? info.title : entry);
+			obs_data_set_int(item, "duration", info.duration);
+			if (info.known) {
+				if (info.state == YT_FETCH_READY)
+					status = "ready";
+				else if (info.state == YT_FETCH_FAILED)
+					status = "failed";
+				else if (info.running)
+					status = "downloading";
+				else
+					status = "queued";
+				obs_data_set_int(item, "progress", info.progress);
+			}
+		}
+		if (s->cur >= 0 && i == s->cur_index)
+			status = "playing";
+		else if (s->waiting && i == s->waiting_for && strcmp(status, "downloading") != 0)
+			status = "waiting";
+		obs_data_set_string(item, "status", status);
+
+		obs_data_array_push_back(arr, item);
+		obs_data_release(item);
+	}
+	pthread_mutex_unlock(&s->mutex);
+
+	obs_data_set_array(root, "items", arr);
+	calldata_set_string(cd, "json", obs_data_get_json(root));
+	obs_data_array_release(arr);
+	obs_data_release(root);
+}
+
+/* void play_index(in int index) */
+static void proc_play_index(void *data, calldata_t *cd)
+{
+	struct yt_source *s = data;
+	long long index = calldata_int(cd, "index");
+	pthread_mutex_lock(&s->mutex);
+	if (index >= 0 && (size_t)index < s->items.num) {
+		YT_LOG(LOG_INFO, "Jump to item %lld", index + 1);
+		start_at_locked(s, (size_t)index);
+	}
+	pthread_mutex_unlock(&s->mutex);
+}
+
+/* void refresh_lists() */
+static void proc_refresh_lists(void *data, calldata_t *cd)
+{
+	UNUSED_PARAMETER(cd);
+	refresh_lists_clicked(NULL, NULL, data);
+}
+
 static void *yt_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct yt_source *s = bzalloc(sizeof(*s));
@@ -787,6 +893,11 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	}
 
 	yt_update(s, settings);
+
+	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	proc_handler_add(ph, "void get_queue(out string json)", proc_get_queue, s);
+	proc_handler_add(ph, "void play_index(in int index)", proc_play_index, s);
+	proc_handler_add(ph, "void refresh_lists()", proc_refresh_lists, s);
 	return s;
 }
 

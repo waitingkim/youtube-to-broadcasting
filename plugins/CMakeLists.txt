@@ -117,5 +117,6 @@ add_core_module(win-capture PLATFORMS WINDOWS)
 add_core_module(win-dshow PLATFORMS WINDOWS)
 add_core_module(win-wasapi PLATFORMS WINDOWS)
 add_core_module(youtube-playlist)
+add_core_module(youtube-playlist-ui PLATFORMS WINDOWS MACOS LINUX)
 
 set_obs_core_modules()

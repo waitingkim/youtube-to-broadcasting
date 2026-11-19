@@ -44,3 +44,16 @@ uint32_t yt_fetcher_list_generation(const char *url);
 
 /* Re-expand the playlist in the background. */
 void yt_fetcher_refresh_list(const char *url);
+
+/* Status for UIs (does not queue anything) ------------------------------- */
+
+struct yt_item_info {
+	bool known; /* requested at least once this session */
+	enum yt_fetch_state state;
+	bool running; /* downloading right now */
+	int progress; /* 0-100 while running */
+	char title[256];
+	int duration; /* seconds, 0 = unknown */
+};
+
+bool yt_fetcher_peek(const char *url, struct yt_item_info *info);

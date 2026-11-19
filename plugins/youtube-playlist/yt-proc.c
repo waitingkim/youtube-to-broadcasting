@@ -11,6 +11,12 @@ int yt_proc_run(const char *const *argv, struct dstr *output)
 	dstr_copy(output, "process execution is not implemented on Windows");
 	return -1;
 }
+int yt_proc_run_lines(const char *const *argv, struct dstr *output, yt_proc_line_cb cb, void *opaque)
+{
+	UNUSED_PARAMETER(cb);
+	UNUSED_PARAMETER(opaque);
+	return yt_proc_run(argv, output);
+}
 void yt_proc_cancel_all(void) {}
 void yt_proc_init(void) {}
 void yt_proc_free(void) {}
@@ -53,6 +59,11 @@ void yt_proc_cancel_all(void)
 
 int yt_proc_run(const char *const *argv, struct dstr *output)
 {
+	return yt_proc_run_lines(argv, output, NULL, NULL);
+}
+
+int yt_proc_run_lines(const char *const *argv, struct dstr *output, yt_proc_line_cb cb, void *opaque)
+{
 	int fds[2];
 	pid_t pid;
 	int status = 0;
@@ -94,12 +105,28 @@ int yt_proc_run(const char *const *argv, struct dstr *output)
 	}
 
 	char buf[4096];
+	size_t line_start = 0;
 	for (;;) {
 		ssize_t n = read(fds[0], buf, sizeof(buf));
-		if (n > 0)
+		if (n > 0) {
 			dstr_ncat(output, buf, (size_t)n);
-		else if (n == 0 || errno != EINTR)
+			if (cb) {
+				/* emit complete lines; '\r' also ends progress lines */
+				for (size_t i = line_start; i < output->len; i++) {
+					char c = output->array[i];
+					if (c == '\n' || c == '\r') {
+						struct dstr line = {0};
+						dstr_ncopy(&line, output->array + line_start, i - line_start);
+						if (line.len)
+							cb(opaque, line.array);
+						dstr_free(&line);
+						line_start = i + 1;
+					}
+				}
+			}
+		} else if (n == 0 || errno != EINTR) {
 			break;
+		}
 	}
 	close(fds[0]);
 

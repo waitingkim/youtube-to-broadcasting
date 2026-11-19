@@ -47,6 +47,13 @@ struct fetch_entry {
 	bool running;
 	char *path;
 	uint64_t last_touch_ns;
+	int progress; /* 0-100 while running */
+};
+
+struct meta_entry {
+	char *key;
+	char *title;
+	int duration; /* seconds, 0 = unknown */
 };
 
 /* An expanded playlist / channel: list of video URLs. */
@@ -72,6 +79,10 @@ static struct {
 
 	DARRAY(struct fetch_entry) entries;
 	DARRAY(struct list_entry) lists;
+	DARRAY(struct meta_entry) meta;
+	char *meta_path;
+	DARRAY(char *) meta_wanted; /* "key\turl" lookups queued, never repeated */
+	DARRAY(char *) meta_tried;  /* keys already looked up this session */
 
 	char *cache_dir;
 	char *bin_dir;
@@ -140,6 +151,94 @@ static char *cache_file_for(const char *key)
 	struct dstr path = {0};
 	dstr_printf(&path, "%s/%s.mkv", f.cache_dir, key);
 	return path.array;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* metadata (titles/durations), persisted in cache/meta.tsv                  */
+
+static struct meta_entry *find_meta(const char *key)
+{
+	for (size_t i = 0; i < f.meta.num; i++)
+		if (strcmp(f.meta.array[i].key, key) == 0)
+			return &f.meta.array[i];
+	return NULL;
+}
+
+/* call with f.mutex held; `persist` appends to meta.tsv */
+static void set_meta_locked(const char *key, const char *title, int duration, bool persist)
+{
+	if (!title || !*title)
+		return;
+	struct meta_entry *m = find_meta(key);
+	if (m && m->duration == duration && strcmp(m->title, title) == 0)
+		return;
+	if (!m) {
+		m = da_push_back_new(f.meta);
+		m->key = bstrdup(key);
+	} else {
+		bfree(m->title);
+	}
+	m->title = bstrdup(title);
+	m->duration = duration;
+
+	if (persist) {
+		os_mkdirs(f.cache_dir);
+		FILE *fp = os_fopen(f.meta_path, "ab");
+		if (fp) {
+			fprintf(fp, "%s\t%d\t%s\n", key, duration, title);
+			fclose(fp);
+		}
+	}
+}
+
+static bool str_in(char **arr, size_t n, const char *key, size_t key_len)
+{
+	for (size_t i = 0; i < n; i++)
+		if (strncmp(arr[i], key, key_len) == 0 && (arr[i][key_len] == 0 || arr[i][key_len] == '\t'))
+			return true;
+	return false;
+}
+
+/* f.mutex held: schedule a title lookup for `key` unless known or tried */
+static void want_meta_locked(const char *key, const char *url)
+{
+	size_t len = strlen(key);
+	if (find_meta(key) || str_in(f.meta_tried.array, f.meta_tried.num, key, len) ||
+	    str_in(f.meta_wanted.array, f.meta_wanted.num, key, len))
+		return;
+	struct dstr item = {0};
+	dstr_printf(&item, "%s\t%s", key, url);
+	da_push_back(f.meta_wanted, &item.array);
+	os_sem_post(f.sem);
+}
+
+static void load_meta(void)
+{
+	char *text = os_quick_read_utf8_file(f.meta_path);
+	if (!text)
+		return;
+	char **lines = strlist_split(text, '\n', false);
+	for (char **line = lines; line && *line; line++) {
+		char **cols = strlist_split(*line, '\t', true);
+		if (cols && cols[0] && cols[1] && cols[2])
+			set_meta_locked(cols[0], cols[2], atoi(cols[1]), false); /* later lines win */
+		strlist_free(cols);
+	}
+	strlist_free(lines);
+	bfree(text);
+}
+
+/* parse "<duration>\t<title>" as printed by yt-dlp ("NA" when unknown) */
+static void meta_from_fields(const char *key, const char *fields)
+{
+	const char *tab = strchr(fields, '\t');
+	if (!tab)
+		return;
+	int duration = atoi(fields); /* "NA" -> 0, "123.0" -> 123 */
+	pthread_mutex_lock(&f.mutex);
+	set_meta_locked(key, tab + 1, duration, true);
+	pthread_mutex_unlock(&f.mutex);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -290,6 +389,42 @@ static void log_ytdlp_errors(const char *url, const char *output)
 	strlist_free(lines);
 }
 
+static struct fetch_entry *find_entry(const char *key);
+
+struct job_ctx {
+	const char *key;
+	int part;          /* 1 = video, 2 = audio */
+	double last_pct;
+};
+
+static void job_line(void *opaque, const char *line)
+{
+	struct job_ctx *ctx = opaque;
+
+	if (strncmp(line, "META\t", 5) == 0) {
+		meta_from_fields(ctx->key, line + 5);
+		return;
+	}
+	if (strncmp(line, "PROG\t", 5) != 0)
+		return;
+
+	double pct = atof(line + 5 + strspn(line + 5, " "));
+	if (pct + 20.0 < ctx->last_pct && ctx->part == 1)
+		ctx->part = 2; /* percentage restarted: second file (audio) */
+	ctx->last_pct = pct;
+
+	/* video is most of the bytes: weight it 85% */
+	int overall = ctx->part == 1 ? (int)(pct * 0.85) : 85 + (int)(pct * 0.15);
+	if (overall > 99)
+		overall = 99;
+
+	pthread_mutex_lock(&f.mutex);
+	struct fetch_entry *e = find_entry(ctx->key);
+	if (e)
+		e->progress = overall;
+	pthread_mutex_unlock(&f.mutex);
+}
+
 static bool run_job(const char *key, const char *url, int max_height, const char *final_path)
 {
 	struct dstr fmt = {0}, tmpl = {0}, out = {0}, part = {0}, err = {0};
@@ -309,7 +444,6 @@ static bool run_job(const char *key, const char *url, int max_height, const char
 			      "-q",
 			      "--no-warnings",
 			      "--no-playlist",
-			      "--no-progress",
 			      "--no-mtime",
 			      "--match-filter",
 			      "!is_live",
@@ -318,13 +452,20 @@ static bool run_job(const char *key, const char *url, int max_height, const char
 			      "-o",
 			      tmpl.array,
 			      "--print",
+			      "pre_process:META\t%(duration)s\t%(title)s",
+			      "--print",
 			      "after_move:filepath",
+			      "--progress",
+			      "--newline",
+			      "--progress-template",
+			      "download:PROG\t%(progress._percent_str)s",
 			      "--",
 			      url,
 			      NULL};
 
+	struct job_ctx ctx = {.key = key, .part = 1, .last_pct = 0.0};
 	uint64_t t0 = os_gettime_ns();
-	int code = yt_proc_run(argv, &out);
+	int code = yt_proc_run_lines(argv, &out, job_line, &ctx);
 	if (f.stop)
 		goto done;
 
@@ -413,7 +554,7 @@ static void cache_remove_partials(void)
 	size_t removed = 0;
 	while ((ent = os_readdir(dir)) != NULL) {
 		if (ent->directory || ent->d_name[0] == '.' || ends_with(ent->d_name, ".mkv") ||
-		    ends_with(ent->d_name, ".list"))
+		    ends_with(ent->d_name, ".list") || strcmp(ent->d_name, "meta.tsv") == 0)
 			continue;
 		dstr_printf(&path, "%s/%s", f.cache_dir, ent->d_name);
 		if (os_unlink(path.array) == 0)
@@ -558,8 +699,8 @@ static bool run_list_job(const char *url, const char *list_path, char ***urls_ou
 		return false;
 
 	normalize_list_url(url, &norm);
-	const char *argv[] = {f.ytdlp_path, "-q", "--no-warnings", "--flat-playlist", "--print", "url", "--", norm.array,
-			      NULL};
+	const char *argv[] = {f.ytdlp_path,   "-q", "--no-warnings", "--flat-playlist", "--print",
+			      "%(url)s\t%(duration)s\t%(title)s", "--", norm.array, NULL};
 
 	int code = yt_proc_run(argv, &out);
 	if (f.stop)
@@ -570,9 +711,18 @@ static bool run_list_job(const char *url, const char *list_path, char ***urls_ou
 		struct dstr l = {0};
 		dstr_copy(&l, *line);
 		dstr_depad(&l);
-		if (yt_fetcher_is_remote(l.array)) {
-			dstr_cat_dstr(&file, &l);
+		char *tab = l.array ? strchr(l.array, '\t') : NULL;
+		if (tab)
+			*tab = 0;
+		if (l.array && yt_fetcher_is_remote(l.array)) {
+			dstr_cat(&file, l.array);
 			dstr_cat(&file, "\n");
+			if (tab) {
+				struct dstr key = {0};
+				make_key(l.array, &key);
+				meta_from_fields(key.array, tab + 1);
+				dstr_free(&key);
+			}
 		}
 		dstr_free(&l);
 	}
@@ -678,6 +828,56 @@ static struct fetch_entry *find_entry(const char *key)
 	return NULL;
 }
 
+
+/* Look up title/duration of one cached video that has none (lowest priority). */
+static void work_one_meta(void)
+{
+	char *key = NULL, *url = NULL;
+
+	pthread_mutex_lock(&f.mutex);
+	if (f.meta_wanted.num) {
+		char *item = f.meta_wanted.array[0];
+		da_erase(f.meta_wanted, 0);
+		char *tab = strchr(item, '\t');
+		*tab = 0;
+		key = bstrdup(item);
+		url = bstrdup(tab + 1);
+		char *tried = bstrdup(item);
+		da_push_back(f.meta_tried, &tried);
+		bfree(item);
+	}
+	pthread_mutex_unlock(&f.mutex);
+
+	if (!key)
+		return;
+
+	pthread_mutex_lock(&f.mutex);
+	bool known = find_meta(key) != NULL; /* a download may have filled it */
+	pthread_mutex_unlock(&f.mutex);
+
+	if (!known && ensure_ytdlp()) {
+		const char *argv[] = {f.ytdlp_path, "-q", "--no-warnings", "--no-playlist", "--skip-download",
+				      "--print", "%(duration)s\t%(title)s", "--", url, NULL};
+		struct dstr out = {0};
+		if (yt_proc_run(argv, &out) == 0 && out.len) {
+			dstr_depad(&out);
+			char *nl = strchr(out.array, '\n');
+			if (nl)
+				*nl = 0;
+			meta_from_fields(key, out.array);
+		}
+		dstr_free(&out);
+	}
+	bfree(key);
+	bfree(url);
+
+	/* more may be waiting */
+	pthread_mutex_lock(&f.mutex);
+	if (f.meta_wanted.num)
+		os_sem_post(f.sem);
+	pthread_mutex_unlock(&f.mutex);
+}
+
 static void *worker(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -704,6 +904,7 @@ static void *worker(void *unused)
 			struct fetch_entry *e = &f.entries.array[i];
 			if (e->state == YT_FETCH_PENDING && !e->running) {
 				e->running = true;
+				e->progress = 0;
 				key = bstrdup(e->key);
 				url = bstrdup(e->url);
 				max_height = e->max_height;
@@ -712,8 +913,10 @@ static void *worker(void *unused)
 		}
 		pthread_mutex_unlock(&f.mutex);
 
-		if (!key)
+		if (!key) {
+			work_one_meta();
 			continue;
+		}
 
 		char *path = cache_file_for(key);
 		FETCH_LOG(LOG_INFO, "Fetching %s", url);
@@ -756,6 +959,11 @@ void yt_fetcher_init(void)
 
 	f.cache_limit = DEFAULT_CACHE_LIMIT;
 	f.cache_dir = obs_module_config_path("cache");
+	f.meta_path = obs_module_config_path("cache/meta.tsv");
+	da_init(f.meta);
+	da_init(f.meta_wanted);
+	da_init(f.meta_tried);
+	load_meta();
 	f.bin_dir = obs_module_config_path("bin");
 	f.ytdlp_path = obs_module_config_path(YTDLP_REL_PATH);
 
@@ -785,6 +993,18 @@ void yt_fetcher_free(void)
 		strlist_free(f.lists.array[i].urls);
 	}
 	da_free(f.lists);
+	for (size_t i = 0; i < f.meta.num; i++) {
+		bfree(f.meta.array[i].key);
+		bfree(f.meta.array[i].title);
+	}
+	da_free(f.meta);
+	for (size_t i = 0; i < f.meta_wanted.num; i++)
+		bfree(f.meta_wanted.array[i]);
+	da_free(f.meta_wanted);
+	for (size_t i = 0; i < f.meta_tried.num; i++)
+		bfree(f.meta_tried.array[i]);
+	da_free(f.meta_tried);
+	bfree(f.meta_path);
 	os_sem_destroy(f.sem);
 	pthread_mutex_destroy(&f.mutex);
 	bfree(f.cache_dir);
@@ -816,6 +1036,7 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 		if (os_file_exists(cached)) {
 			n.state = YT_FETCH_READY;
 			n.path = cached;
+			want_meta_locked(key.array, url);
 		} else {
 			n.state = YT_FETCH_PENDING;
 			bfree(cached);
@@ -947,4 +1168,40 @@ void yt_fetcher_refresh_list(const char *url)
 		os_sem_post(f.sem);
 	}
 	pthread_mutex_unlock(&f.mutex);
+}
+
+bool yt_fetcher_peek(const char *url, struct yt_item_info *info)
+{
+	struct dstr key = {0};
+	memset(info, 0, sizeof(*info));
+	make_key(url, &key);
+
+	pthread_mutex_lock(&f.mutex);
+	struct fetch_entry *e = find_entry(key.array);
+	if (e) {
+		info->known = true;
+		info->state = e->state;
+		info->running = e->running;
+		info->progress = e->progress;
+	} else {
+		/* not requested this session, but maybe cached already */
+		char *cached = cache_file_for(key.array);
+		if (os_file_exists(cached)) {
+			info->known = true;
+			info->state = YT_FETCH_READY;
+		}
+		bfree(cached);
+	}
+	struct meta_entry *m = find_meta(key.array);
+	if (m) {
+		snprintf(info->title, sizeof(info->title), "%s", m->title);
+		info->duration = m->duration;
+	} else if (!(e && e->running)) {
+		/* the download prints the title itself; otherwise look it up */
+		want_meta_locked(key.array, url);
+	}
+	pthread_mutex_unlock(&f.mutex);
+
+	dstr_free(&key);
+	return info->known;
 }
