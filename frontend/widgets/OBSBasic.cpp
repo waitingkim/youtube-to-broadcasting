@@ -338,6 +338,8 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 
 	stringstream name;
 	name << "OBS " << App()->GetVersionString();
+	if (*OBS_BUILD_LABEL)
+		name << " (" << OBS_BUILD_LABEL << ")";
 	blog(LOG_INFO, "%s", name.str().c_str());
 	blog(LOG_INFO, "---------------------------------");
 
@@ -1988,6 +1990,8 @@ void OBSBasic::UpdateTitleBar()
 	}
 
 	name << App()->GetVersionString(false);
+	if (*OBS_BUILD_LABEL)
+		name << " (" << OBS_BUILD_LABEL << ")";
 	if (safe_mode) {
 		name << " (" << Str("TitleBar.SafeMode") << ")";
 	}

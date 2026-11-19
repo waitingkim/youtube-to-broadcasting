@@ -69,6 +69,10 @@ include(cmake/feature-youtube.cmake)
 include(cmake/feature-whatsnew.cmake)
 include(cmake/feature-idian-playground.cmake)
 
+# Label shown after the version in the window title and the startup log,
+# e.g. to mark a build verified for a production. Empty: no label.
+set(OBS_BUILD_LABEL "EASL LIVE 검증" CACHE STRING "Build label shown in the window title (empty = none)")
+
 configure_file(cmake/templates/ui-config.h.in ui-config.h)
 
 target_sources(
