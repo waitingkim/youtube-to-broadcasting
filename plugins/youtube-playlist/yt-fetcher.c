@@ -11,6 +11,8 @@
 #include <ctype.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <utime.h>
+#include <stdlib.h>
 
 #define FETCH_LOG(level, format, ...) blog(level, "[youtube-playlist fetcher] " format, ##__VA_ARGS__)
 
@@ -44,6 +46,7 @@ struct fetch_entry {
 	enum yt_fetch_state state;
 	bool running;
 	char *path;
+	uint64_t last_touch_ns;
 };
 
 static struct {
@@ -60,7 +63,14 @@ static struct {
 	char *ytdlp_path;
 	bool ytdlp_ready;
 	bool ytdlp_failed;
+
+	volatile long long cache_limit; /* bytes, 0 = unlimited */
+	volatile bool evict_requested;
 } f;
+
+#define DEFAULT_CACHE_LIMIT (10LL * 1024 * 1024 * 1024)
+#define TOUCH_INTERVAL_NS (60ULL * 1000000000ULL)
+#define KEEP_NEWEST 3 /* never evict the most recently used files */
 
 /* ------------------------------------------------------------------------- */
 /* keys                                                                      */
@@ -354,6 +364,128 @@ done:
 	return ok;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* cache maintenance (worker thread)                                         */
+
+struct cache_file {
+	char *path;
+	char *key;
+	long long size;
+	time_t mtime;
+};
+
+static int cmp_mtime(const void *a, const void *b)
+{
+	const struct cache_file *x = a, *y = b;
+	return (x->mtime > y->mtime) - (x->mtime < y->mtime);
+}
+
+static bool ends_with(const char *s, const char *suffix)
+{
+	size_t n = strlen(s), m = strlen(suffix);
+	return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+/* Remove leftovers of interrupted downloads/remuxes. */
+static void cache_remove_partials(void)
+{
+	os_dir_t *dir = os_opendir(f.cache_dir);
+	if (!dir)
+		return;
+	struct os_dirent *ent;
+	struct dstr path = {0};
+	size_t removed = 0;
+	while ((ent = os_readdir(dir)) != NULL) {
+		if (ent->directory || ent->d_name[0] == '.' || ends_with(ent->d_name, ".mkv"))
+			continue;
+		dstr_printf(&path, "%s/%s", f.cache_dir, ent->d_name);
+		if (os_unlink(path.array) == 0)
+			removed++;
+	}
+	os_closedir(dir);
+	dstr_free(&path);
+	if (removed)
+		FETCH_LOG(LOG_INFO, "Removed %zu partial file(s) from cache", removed);
+}
+
+static bool key_is_running(const char *key)
+{
+	bool running = false;
+	pthread_mutex_lock(&f.mutex);
+	for (size_t i = 0; i < f.entries.num; i++) {
+		if (f.entries.array[i].running && strcmp(f.entries.array[i].key, key) == 0) {
+			running = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&f.mutex);
+	return running;
+}
+
+/* Least-recently-used eviction down to the configured limit.  Files are
+ * "used" when a source requests them (mtime is refreshed, see request). */
+static void cache_evict(void)
+{
+	long long limit = f.cache_limit;
+	if (limit <= 0)
+		return;
+
+	os_dir_t *dir = os_opendir(f.cache_dir);
+	if (!dir)
+		return;
+
+	DARRAY(struct cache_file) files;
+	da_init(files);
+	long long total = 0;
+	struct os_dirent *ent;
+
+	while ((ent = os_readdir(dir)) != NULL) {
+		if (ent->directory || !ends_with(ent->d_name, ".mkv"))
+			continue;
+		struct cache_file cf = {0};
+		struct dstr path = {0};
+		struct stat st;
+		dstr_printf(&path, "%s/%s", f.cache_dir, ent->d_name);
+		if (stat(path.array, &st) != 0) {
+			dstr_free(&path);
+			continue;
+		}
+		cf.path = path.array;
+		cf.key = bstrdup_n(ent->d_name, strlen(ent->d_name) - 4);
+		cf.size = (long long)st.st_size;
+		cf.mtime = st.st_mtime;
+		total += cf.size;
+		da_push_back(files, &cf);
+	}
+	os_closedir(dir);
+
+	if (total > limit && files.num > KEEP_NEWEST) {
+		qsort(files.array, files.num, sizeof(struct cache_file), cmp_mtime);
+		for (size_t i = 0; i + KEEP_NEWEST < files.num && total > limit; i++) {
+			struct cache_file *cf = &files.array[i];
+			if (key_is_running(cf->key))
+				continue;
+			/* unlinking a file that is being played is safe on POSIX: the
+			 * open descriptor stays valid until the player closes it */
+			if (os_unlink(cf->path) == 0) {
+				total -= cf->size;
+				FETCH_LOG(LOG_INFO, "Cache limit: evicted %s (%.1f MB)", cf->key,
+					  (double)cf->size / (1024.0 * 1024.0));
+			}
+		}
+	}
+
+	FETCH_LOG(LOG_DEBUG, "Cache usage %.1f MB / limit %.1f MB", (double)total / (1024.0 * 1024.0),
+		  (double)limit / (1024.0 * 1024.0));
+
+	for (size_t i = 0; i < files.num; i++) {
+		bfree(files.array[i].path);
+		bfree(files.array[i].key);
+	}
+	da_free(files);
+}
+
 static struct fetch_entry *find_entry(const char *key)
 {
 	for (size_t i = 0; i < f.entries.num; i++)
@@ -367,9 +499,15 @@ static void *worker(void *unused)
 	UNUSED_PARAMETER(unused);
 	os_set_thread_name("yt-playlist-fetcher");
 
+	cache_remove_partials();
+	cache_evict();
+
 	while (os_sem_wait(f.sem) == 0 && !f.stop) {
 		char *key = NULL, *url = NULL;
 		int max_height = 0;
+
+		if (os_atomic_exchange_bool(&f.evict_requested, false))
+			cache_evict();
 
 		pthread_mutex_lock(&f.mutex);
 		for (size_t i = 0; i < f.entries.num; i++) {
@@ -408,6 +546,9 @@ static void *worker(void *unused)
 		bfree(path);
 		bfree(key);
 		bfree(url);
+
+		if (ok)
+			cache_evict();
 	}
 	return NULL;
 }
@@ -422,6 +563,7 @@ void yt_fetcher_init(void)
 	os_sem_init(&f.sem, 0);
 	da_init(f.entries);
 
+	f.cache_limit = DEFAULT_CACHE_LIMIT;
 	f.cache_dir = obs_module_config_path("cache");
 	f.bin_dir = obs_module_config_path("bin");
 	f.ytdlp_path = obs_module_config_path(YTDLP_REL_PATH);
@@ -485,6 +627,21 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 		e = da_push_back_new(f.entries);
 		*e = n;
 	}
+	if (e->state == YT_FETCH_READY && !os_file_exists(e->path)) {
+		/* evicted from the cache (or deleted by hand): fetch again */
+		bfree(e->path);
+		e->path = NULL;
+		e->state = YT_FETCH_PENDING;
+		e->max_height = max_height;
+		os_sem_post(f.sem);
+	}
+	if (e->state == YT_FETCH_READY) {
+		uint64_t now = os_gettime_ns();
+		if (!e->last_touch_ns || now - e->last_touch_ns > TOUCH_INTERVAL_NS) {
+			e->last_touch_ns = now;
+			utime(e->path, NULL); /* mark as recently used for LRU */
+		}
+	}
 	state = e->state;
 	if (state == YT_FETCH_READY && path_out)
 		*path_out = bstrdup(e->path);
@@ -492,4 +649,17 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 
 	dstr_free(&key);
 	return state;
+}
+
+void yt_fetcher_set_cache_limit(long long bytes)
+{
+	long long old = f.cache_limit;
+	f.cache_limit = bytes;
+	if (bytes > 0 && (old <= 0 || bytes < old)) {
+		FETCH_LOG(LOG_INFO, "Cache limit set to %.1f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+		/* a lower limit may already be exceeded: let the worker trim now */
+		os_atomic_set_bool(&f.evict_requested, true);
+		if (f.thread_ok)
+			os_sem_post(f.sem);
+	}
 }

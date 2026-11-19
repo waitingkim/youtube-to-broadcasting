@@ -24,3 +24,6 @@ bool yt_fetcher_is_remote(const char *item);
 /* Non-blocking.  Queues the item if unknown.  When READY, *path_out receives
  * a bstrdup'ed local file path (caller frees). */
 enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **path_out);
+
+/* Cache size limit in bytes (LRU eviction after each download); 0 = none. */
+void yt_fetcher_set_cache_limit(long long bytes);

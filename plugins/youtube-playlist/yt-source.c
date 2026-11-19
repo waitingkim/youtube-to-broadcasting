@@ -32,6 +32,14 @@
 #define S_LOOP "loop"
 #define S_HW_DECODE "hw_decode"
 #define S_MAX_HEIGHT "max_height"
+#define S_RESUME "resume"
+#define S_CLEAR_ON_WAIT "clear_on_wait"
+#define S_CACHE_LIMIT "cache_limit_gb"
+
+/* saved by yt_save (not shown in properties) */
+#define S_RESUME_ITEM "resume_item"
+#define S_RESUME_INDEX "resume_index"
+#define S_RESUME_MS "resume_ms"
 
 #define T_(text) obs_module_text(text)
 
@@ -60,6 +68,17 @@ struct yt_source {
 	bool loop;
 	bool hw_decode;
 	int max_height;
+	bool resume;
+	bool clear_on_wait;
+
+	/* resume state loaded from settings, consumed by the first start */
+	char *resume_item;
+	size_t resume_index;
+	int64_t resume_ms;
+
+	/* seek to apply when the given item starts */
+	size_t seek_index;
+	int64_t seek_ms;
 
 	/* playback */
 	struct yt_player *slots[2];
@@ -75,6 +94,8 @@ struct yt_source {
 	bool emit_started; /* signal media_started */
 	bool emit_ended;   /* signal media_ended + clear video */
 	size_t waiting_for; /* index whose download we are waiting on (log once) */
+	bool waiting;       /* nothing playing: waiting for a download */
+	bool emit_clear;    /* clear the video while waiting */
 };
 
 enum item_res {
@@ -158,6 +179,13 @@ static void begin_player_locked(struct yt_source *s, int slot)
 	 * the current time so the first frames are not stale. */
 	media_playback_play_pause(p->mp, false);
 
+	if (s->seek_ms > 0 && s->seek_index == p->index) {
+		YT_LOG(LOG_INFO, "Resuming item %zu at %.1fs", p->index + 1, (double)s->seek_ms / 1000.0);
+		media_playback_seek(p->mp, s->seek_ms);
+	}
+	s->seek_ms = 0;
+	s->waiting = false;
+
 	s->emit_started = true;
 	s->pending = true;
 
@@ -210,7 +238,38 @@ static void start_at_locked(struct yt_source *s, size_t index)
 	s->need_start = true;
 	s->fail_streak = 0;
 	s->waiting_for = NO_INDEX;
+	s->waiting = false;
+	s->seek_ms = 0;
 	s->pending = true;
+}
+
+/* First start after loading: continue where the previous session stopped if
+ * the saved item is still in the playlist, otherwise start from the top. */
+static void start_initial_locked(struct yt_source *s)
+{
+	size_t index = 0;
+	int64_t ms = 0;
+
+	if (s->resume && s->resume_item) {
+		size_t found = NO_INDEX;
+		if (s->resume_index < s->items.num && strcmp(s->items.array[s->resume_index], s->resume_item) == 0)
+			found = s->resume_index;
+		for (size_t i = 0; found == NO_INDEX && i < s->items.num; i++)
+			if (strcmp(s->items.array[i], s->resume_item) == 0)
+				found = i;
+		if (found != NO_INDEX) {
+			index = found;
+			ms = s->resume_ms;
+		}
+	}
+	bfree(s->resume_item);
+	s->resume_item = NULL;
+
+	start_at_locked(s, index);
+	if (index || ms) {
+		s->seek_index = index;
+		s->seek_ms = ms;
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -339,6 +398,8 @@ static void fill_slots_locked(struct yt_source *s)
 			/* keep polling from yt_tick until the download finishes */
 			if (s->waiting_for != index) {
 				s->waiting_for = index;
+				s->waiting = true;
+				s->emit_clear = s->clear_on_wait;
 				YT_LOG(LOG_INFO, "Waiting for download of item %zu: %s", index + 1,
 				       s->items.array[index]);
 			}
@@ -414,7 +475,7 @@ static void yt_tick(void *data, float seconds)
 	UNUSED_PARAMETER(seconds);
 	struct yt_source *s = data;
 	struct yt_player *trash[2] = {NULL, NULL};
-	bool started, ended;
+	bool started, ended, clear;
 
 	pthread_mutex_lock(&s->mutex);
 	if (!s->pending) {
@@ -441,10 +502,14 @@ static void yt_tick(void *data, float seconds)
 	fill_slots_locked(s);
 	started = s->emit_started;
 	ended = s->emit_ended;
+	clear = s->emit_clear;
 	s->emit_started = false;
 	s->emit_ended = false;
+	s->emit_clear = false;
 	pthread_mutex_unlock(&s->mutex);
 
+	if (clear)
+		obs_source_output_video(s->source, NULL);
 	if (started)
 		obs_source_media_started(s->source);
 	if (ended) {
@@ -458,6 +523,9 @@ static void yt_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_LOOP, true);
 	obs_data_set_default_bool(settings, S_HW_DECODE, true);
 	obs_data_set_default_int(settings, S_MAX_HEIGHT, 1080);
+	obs_data_set_default_bool(settings, S_RESUME, true);
+	obs_data_set_default_bool(settings, S_CLEAR_ON_WAIT, true);
+	obs_data_set_default_int(settings, S_CACHE_LIMIT, 10);
 }
 
 static obs_properties_t *yt_properties(void *data)
@@ -478,6 +546,12 @@ static obs_properties_t *yt_properties(void *data)
 		snprintf(name, sizeof(name), "%dp", heights[i]);
 		obs_property_list_add_int(h, name, heights[i]);
 	}
+
+	obs_properties_add_bool(props, S_RESUME, T_("Resume"));
+	obs_property_t *w = obs_properties_add_bool(props, S_CLEAR_ON_WAIT, T_("ClearOnWait"));
+	obs_property_set_long_description(w, T_("ClearOnWait.Description"));
+	obs_property_t *c = obs_properties_add_int(props, S_CACHE_LIMIT, T_("CacheLimit"), 1, 2000, 1);
+	obs_property_int_set_suffix(c, " GB");
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	return props;
 }
@@ -518,6 +592,9 @@ static void yt_update(void *data, obs_data_t *settings)
 	s->max_height = (int)obs_data_get_int(settings, S_MAX_HEIGHT);
 	if (s->max_height <= 0)
 		s->max_height = 1080;
+	s->resume = obs_data_get_bool(settings, S_RESUME);
+	s->clear_on_wait = obs_data_get_bool(settings, S_CLEAR_ON_WAIT);
+	yt_fetcher_set_cache_limit(obs_data_get_int(settings, S_CACHE_LIMIT) * 1024LL * 1024LL * 1024LL);
 
 	if (was_running) {
 		if (hw_changed || !s->items.num) {
@@ -542,7 +619,7 @@ static void yt_update(void *data, obs_data_t *settings)
 			s->pending = true;
 		}
 	} else if (s->items.num && obs_source_active(s->source)) {
-		start_at_locked(s, 0);
+		start_initial_locked(s);
 	}
 
 	pthread_mutex_unlock(&s->mutex);
@@ -556,7 +633,24 @@ static void yt_activate(void *data)
 	struct yt_source *s = data;
 	pthread_mutex_lock(&s->mutex);
 	if (s->state != OBS_MEDIA_STATE_PLAYING && s->state != OBS_MEDIA_STATE_PAUSED)
-		start_at_locked(s, 0);
+		start_initial_locked(s);
+	pthread_mutex_unlock(&s->mutex);
+}
+
+static void yt_save(void *data, obs_data_t *settings)
+{
+	struct yt_source *s = data;
+	pthread_mutex_lock(&s->mutex);
+	if (s->cur >= 0 && s->cur_index < s->items.num) {
+		obs_data_set_string(settings, S_RESUME_ITEM, s->items.array[s->cur_index]);
+		obs_data_set_int(settings, S_RESUME_INDEX, (long long)s->cur_index);
+		obs_data_set_int(settings, S_RESUME_MS, media_playback_get_current_time(s->slots[s->cur]->mp));
+	} else if (s->state == OBS_MEDIA_STATE_ENDED || s->state == OBS_MEDIA_STATE_ERROR) {
+		obs_data_erase(settings, S_RESUME_ITEM);
+		obs_data_erase(settings, S_RESUME_INDEX);
+		obs_data_erase(settings, S_RESUME_MS);
+	}
+	/* otherwise (not started yet / waiting) keep what was saved before */
 	pthread_mutex_unlock(&s->mutex);
 }
 
@@ -570,6 +664,13 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	s->waiting_for = NO_INDEX;
 	pthread_mutex_init(&s->mutex, NULL);
 	da_init(s->items);
+
+	const char *resume_item = obs_data_get_string(settings, S_RESUME_ITEM);
+	if (resume_item && *resume_item) {
+		s->resume_item = bstrdup(resume_item);
+		s->resume_index = (size_t)obs_data_get_int(settings, S_RESUME_INDEX);
+		s->resume_ms = obs_data_get_int(settings, S_RESUME_MS);
+	}
 
 	yt_update(s, settings);
 	return s;
@@ -591,6 +692,7 @@ static void yt_destroy(void *data)
 	free_player(b);
 
 	free_items(s);
+	bfree(s->resume_item);
 	pthread_mutex_destroy(&s->mutex);
 	bfree(s);
 }
@@ -689,6 +791,8 @@ static enum obs_media_state yt_get_state(void *data)
 	struct yt_source *s = data;
 	pthread_mutex_lock(&s->mutex);
 	enum obs_media_state state = s->state;
+	if (state == OBS_MEDIA_STATE_PLAYING && s->waiting)
+		state = OBS_MEDIA_STATE_BUFFERING;
 	pthread_mutex_unlock(&s->mutex);
 	return state;
 }
@@ -704,6 +808,7 @@ struct obs_source_info yt_playlist_source_info = {
 	.get_defaults = yt_defaults,
 	.get_properties = yt_properties,
 	.update = yt_update,
+	.save = yt_save,
 	.activate = yt_activate,
 	.video_tick = yt_tick,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
