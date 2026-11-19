@@ -39,6 +39,7 @@ private slots:
 	void RemoveSelected();
 	void LoopToggled(bool checked);
 	void SelectionChanged();
+	void OpenMyPlaylists();
 
 private:
 	void UpdateSourceList();
@@ -51,6 +52,7 @@ private:
 	void MoveEntry(int settingIndex, int delta);
 	void RemoveEntry(int settingIndex);
 	void PlayItem(QTreeWidgetItem *item);
+	bool AddEntryText(const QString &text);
 
 	QComboBox *sourceCombo;
 	QLabel *nowTitle;
@@ -63,6 +65,7 @@ private:
 	QLineEdit *entryEdit;
 	QPushButton *addButton;
 	QPushButton *refreshListsButton;
+	QPushButton *myPlaylistsButton;
 	QPushButton *upButton;
 	QPushButton *downButton;
 	QPushButton *removeButton;

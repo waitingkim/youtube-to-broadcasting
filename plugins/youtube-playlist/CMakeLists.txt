@@ -9,7 +9,7 @@ endif()
 add_library(youtube-playlist MODULE)
 add_library(OBS::youtube-playlist ALIAS youtube-playlist)
 
-target_sources(youtube-playlist PRIVATE youtube-playlist.c yt-source.c yt-fetcher.c yt-fetcher.h yt-proc.c yt-proc.h yt-remux.c yt-remux.h)
+target_sources(youtube-playlist PRIVATE youtube-playlist.c yt-source.c yt-fetcher.c yt-fetcher.h yt-proc.c yt-proc.h yt-remux.c yt-remux.h yt-oauth.c yt-oauth.h)
 
 target_compile_options(youtube-playlist PRIVATE $<$<COMPILE_LANG_AND_ID:C,AppleClang,Clang>:-Wno-shorten-64-to-32>)
 

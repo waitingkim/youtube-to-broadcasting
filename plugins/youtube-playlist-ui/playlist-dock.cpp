@@ -1,4 +1,5 @@
 #include "playlist-dock.hpp"
+#include "my-playlists-dialog.hpp"
 
 #include <obs-module.h>
 #include <obs.hpp>
@@ -93,6 +94,7 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	entryEdit->setPlaceholderText(T("AddPlaceholder"));
 	addButton = new QPushButton(T("Add"), this);
 	refreshListsButton = new QPushButton(T("RefreshPlaylists"), this);
+	myPlaylistsButton = new QPushButton(T("MyPlaylists.Button"), this);
 	upButton = new QPushButton(T("MoveUp"), this);
 	downButton = new QPushButton(T("MoveDown"), this);
 	removeButton = new QPushButton(T("Remove"), this);
@@ -148,7 +150,10 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(queue, 1);
 	layout->addLayout(edit);
 	layout->addLayout(add);
-	layout->addWidget(refreshListsButton);
+	auto *lists = new QHBoxLayout;
+	lists->addWidget(myPlaylistsButton);
+	lists->addWidget(refreshListsButton);
+	layout->addLayout(lists);
 
 	connect(sourceCombo, &QComboBox::currentIndexChanged, this, &PlaylistDock::SourceChanged);
 	connect(prevButton, &QPushButton::clicked, this, &PlaylistDock::Previous);
@@ -158,6 +163,7 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	connect(addButton, &QPushButton::clicked, this, &PlaylistDock::AddEntry);
 	connect(entryEdit, &QLineEdit::returnPressed, this, &PlaylistDock::AddEntry);
 	connect(refreshListsButton, &QPushButton::clicked, this, &PlaylistDock::RefreshLists);
+	connect(myPlaylistsButton, &QPushButton::clicked, this, &PlaylistDock::OpenMyPlaylists);
 	connect(queue, &QTreeWidget::itemDoubleClicked, this, &PlaylistDock::ItemActivated);
 	connect(queue, &QTreeWidget::customContextMenuRequested, this, &PlaylistDock::ShowContextMenu);
 	connect(queue, &QTreeWidget::itemSelectionChanged, this, &PlaylistDock::SelectionChanged);
@@ -239,7 +245,7 @@ void PlaylistDock::UpdateQueue()
 	bool enabled = source != nullptr;
 	for (QWidget *w : {(QWidget *)prevButton, (QWidget *)playButton, (QWidget *)stopButton,
 			   (QWidget *)nextButton, (QWidget *)entryEdit, (QWidget *)addButton,
-			   (QWidget *)refreshListsButton, (QWidget *)loopCheck})
+			   (QWidget *)refreshListsButton, (QWidget *)loopCheck, (QWidget *)myPlaylistsButton})
 		w->setEnabled(enabled);
 	SelectionChanged();
 
@@ -407,12 +413,12 @@ void PlaylistDock::Previous()
 	Refresh();
 }
 
-void PlaylistDock::AddEntry()
+bool PlaylistDock::AddEntryText(const QString &value)
 {
-	QString text = entryEdit->text().trimmed();
+	QString text = value.trimmed();
 	OBSSourceAutoRelease source = GetSource(SelectedSource());
 	if (text.isEmpty() || !source)
-		return;
+		return false;
 
 	OBSDataAutoRelease settings = obs_source_get_settings(source);
 	OBSDataArrayAutoRelease array = obs_data_get_array(settings, "playlist");
@@ -427,7 +433,20 @@ void PlaylistDock::AddEntry()
 	obs_data_array_push_back(array, entry);
 
 	obs_source_update(source, settings);
-	entryEdit->clear();
+	return true;
+}
+
+void PlaylistDock::AddEntry()
+{
+	if (AddEntryText(entryEdit->text()))
+		entryEdit->clear();
+	Refresh();
+}
+
+void PlaylistDock::OpenMyPlaylists()
+{
+	MyPlaylistsDialog dialog(this, [this](const QString &url) { AddEntryText(url); });
+	dialog.exec();
 	Refresh();
 }
 

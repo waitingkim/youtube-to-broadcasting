@@ -134,7 +134,7 @@ frontend/utility/YoutubeApiWrappers.*   # 플레이리스트 API 추가
 | M3 ✅ | 큐 + 선행 다운로드 | 여러 URL 연속 재생, 다음 항목 사전 준비, 오류 항목 skip |
 | M4 ✅ | 공개 재생목록 | 재생목록 URL → 큐 일괄 등록 |
 | M5 ✅ | Dock UI | 큐 편집/컨트롤/상태 표시 |
-| M6 | 개인 플레이리스트 | OAuth 로그인 → 내 플레이리스트 가져오기 |
+| M6 🧪 | 개인 플레이리스트 | OAuth 로그인 → 내 플레이리스트 가져오기 |
 | M7 | 안정화 | 라이브 URL, 캐시 LRU, yt-dlp 업데이트, 24시간 연속 송출 테스트 |
 
 ## 5.1 M2 구현 메모
@@ -184,6 +184,19 @@ frontend/utility/YoutubeApiWrappers.*   # 플레이리스트 API 추가
   재생목록·채널에서 펼쳐진 영상은 그 재생목록 항목 전체가 이동/삭제됨(삭제 시 확인 창).
   `get_queue`가 항목별 `setting_index`, `from_list`, `list`를 제공. 편집 후에도 현재 재생과 선택은 유지.
 - 독에 "반복" 체크박스(소스 `loop` 설정과 동기화). 큐 헤더(#, 제목, 길이, 상태) 가운데 정렬.
+
+## 5.5 M6 구현 메모 (사용자 로그인 검증 대기)
+- 인증 방식: **사용자 본인의 Google OAuth 클라이언트**(데스크톱 앱), 권한 `youtube.readonly`.
+  (브라우저 쿠키 방식은 계정 제한 위험 때문에 채택하지 않음)
+- 역할 분담:
+  - `youtube-playlist`(C): 자격 증명 저장(`plugin_config/youtube-playlist/oauth.json`, 0600), 토큰 갱신,
+    YouTube Data API 호출(시스템 curl, 비밀값은 0600 임시 파일로 전달해 `ps`에 노출 안 됨).
+    전역 프로시저 `youtube_playlist_oauth_status / _set_client / _exchange / _logout`, `youtube_playlist_my_playlists`.
+  - `youtube-playlist-ui`(Qt): "내 재생목록…" 대화상자 — 브라우저 로그인(루프백 127.0.0.1 + PKCE S256 + state),
+    재생목록 선택(좋아요 표시한 동영상 포함) → `youtube.com/playlist?list=ID` 항목으로 추가.
+- 로그인 상태에서는 재생목록 펼치기를 **API 우선**(비공개 재생목록도 펼쳐지고 자동 갱신), 실패 시 yt-dlp.
+  공개·일부 공개 영상만 큐에 넣음(비공개/삭제 영상 제외). 다운로드는 계속 익명(yt-dlp).
+- 로그아웃 시 Google 쪽 토큰도 폐기(revoke). 토큰이 취소/만료(invalid_grant)되면 자동으로 로그아웃 상태로 전환.
 
 ## 6. 미결 사항
 1. ~~레포 운영 방식~~ → 포크로 결정 (§0)

@@ -1,6 +1,7 @@
 #include "yt-fetcher.h"
 #include "yt-proc.h"
 #include "yt-remux.h"
+#include "yt-oauth.h"
 
 #include <obs-module.h>
 #include <util/threading.h>
@@ -694,15 +695,29 @@ static bool run_list_job(const char *url, const char *list_path, char ***urls_ou
 {
 	struct dstr norm = {0}, out = {0}, file = {0};
 	bool ok = false;
+	int code = -1;
 
-	if (!ensure_ytdlp())
-		return false;
+	/* Logged in: the YouTube Data API also sees the user's private
+	 * playlists (yt-dlp, anonymous, does not). */
+	char *playlist_id = strstr(url, "v=") ? NULL : yt_playlist_id_from_url(url);
+	if (playlist_id && yt_oauth_logged_in()) {
+		if (yt_api_expand_playlist(playlist_id, &out)) {
+			code = 0;
+			FETCH_LOG(LOG_INFO, "%s: expanded through the YouTube API", url);
+		} else {
+			FETCH_LOG(LOG_INFO, "%s: API expansion failed, trying yt-dlp", url);
+		}
+	}
+	bfree(playlist_id);
 
-	normalize_list_url(url, &norm);
-	const char *argv[] = {f.ytdlp_path,   "-q", "--no-warnings", "--flat-playlist", "--print",
-			      "%(url)s\t%(duration)s\t%(title)s", "--", norm.array, NULL};
-
-	int code = yt_proc_run(argv, &out);
+	if (code != 0) {
+		if (!ensure_ytdlp())
+			goto done;
+		normalize_list_url(url, &norm);
+		const char *argv[] = {f.ytdlp_path,   "-q", "--no-warnings", "--flat-playlist", "--print",
+				      "%(url)s\t%(duration)s\t%(title)s", "--", norm.array, NULL};
+		code = yt_proc_run(argv, &out);
+	}
 	if (f.stop)
 		goto done;
 
