@@ -49,6 +49,20 @@ struct fetch_entry {
 	uint64_t last_touch_ns;
 };
 
+/* An expanded playlist / channel: list of video URLs. */
+struct list_entry {
+	char *key;
+	char *url;
+	enum yt_fetch_state state;
+	bool running;
+	bool refresh;         /* re-expand even though READY */
+	uint32_t generation;  /* bumped whenever `urls` or `state` changes */
+	uint64_t fetched_ns;  /* when `urls` was obtained (0 = from disk, stale) */
+	char **urls;          /* strlist, NULL-terminated */
+};
+
+#define LIST_REFRESH_NS (60ULL * 60ULL * 1000000000ULL) /* 1 hour */
+
 static struct {
 	pthread_mutex_t mutex;
 	os_sem_t *sem;
@@ -57,6 +71,7 @@ static struct {
 	volatile bool stop;
 
 	DARRAY(struct fetch_entry) entries;
+	DARRAY(struct list_entry) lists;
 
 	char *cache_dir;
 	char *bin_dir;
@@ -397,7 +412,8 @@ static void cache_remove_partials(void)
 	struct dstr path = {0};
 	size_t removed = 0;
 	while ((ent = os_readdir(dir)) != NULL) {
-		if (ent->directory || ent->d_name[0] == '.' || ends_with(ent->d_name, ".mkv"))
+		if (ent->directory || ent->d_name[0] == '.' || ends_with(ent->d_name, ".mkv") ||
+		    ends_with(ent->d_name, ".list"))
 			continue;
 		dstr_printf(&path, "%s/%s", f.cache_dir, ent->d_name);
 		if (os_unlink(path.array) == 0)
@@ -486,6 +502,174 @@ static void cache_evict(void)
 	da_free(files);
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* playlists / channels                                                      */
+
+static uint64_t fnv1a(const char *str)
+{
+	uint64_t h = 1469598103934665603ULL;
+	for (const char *p = str; *p; p++) {
+		h ^= (uint8_t)*p;
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static char *list_file_for(const char *key)
+{
+	struct dstr path = {0};
+	dstr_printf(&path, "%s/%s.list", f.cache_dir, key);
+	return path.array;
+}
+
+static struct list_entry *find_list(const char *key)
+{
+	for (size_t i = 0; i < f.lists.num; i++)
+		if (strcmp(f.lists.array[i].key, key) == 0)
+			return &f.lists.array[i];
+	return NULL;
+}
+
+/* "/@name" alone lists the channel tabs, not videos: use its videos tab */
+static void normalize_list_url(const char *url, struct dstr *out)
+{
+	dstr_copy(out, url);
+	const char *at = strstr(url, "/@");
+	if (!at)
+		return;
+	const char *rest = strchr(at + 2, '/');
+	const char *query = strchr(at + 2, '?');
+	if (!rest && !query) {
+		dstr_cat(out, "/videos");
+	} else if (!rest && query) {
+		dstr_resize(out, (size_t)(query - url));
+		dstr_cat(out, "/videos");
+		dstr_cat(out, query);
+	}
+}
+
+static bool run_list_job(const char *url, const char *list_path, char ***urls_out)
+{
+	struct dstr norm = {0}, out = {0}, file = {0};
+	bool ok = false;
+
+	if (!ensure_ytdlp())
+		return false;
+
+	normalize_list_url(url, &norm);
+	const char *argv[] = {f.ytdlp_path, "-q", "--no-warnings", "--flat-playlist", "--print", "url", "--", norm.array,
+			      NULL};
+
+	int code = yt_proc_run(argv, &out);
+	if (f.stop)
+		goto done;
+
+	char **lines = strlist_split(out.array ? out.array : "", '\n', false);
+	for (char **line = lines; line && *line; line++) {
+		struct dstr l = {0};
+		dstr_copy(&l, *line);
+		dstr_depad(&l);
+		if (yt_fetcher_is_remote(l.array)) {
+			dstr_cat_dstr(&file, &l);
+			dstr_cat(&file, "\n");
+		}
+		dstr_free(&l);
+	}
+	strlist_free(lines);
+
+	if (!file.len) {
+		if (code != 0)
+			log_ytdlp_errors(url, out.array);
+		else
+			FETCH_LOG(LOG_WARNING, "%s: playlist is empty", url);
+		goto done;
+	}
+
+	os_mkdirs(f.cache_dir);
+	if (!os_quick_write_utf8_file(list_path, file.array, file.len, false))
+		FETCH_LOG(LOG_WARNING, "%s: could not save playlist to %s", url, list_path);
+
+	*urls_out = strlist_split(file.array, '\n', false);
+	ok = true;
+
+done:
+	dstr_free(&norm);
+	dstr_free(&out);
+	dstr_free(&file);
+	return ok;
+}
+
+static size_t strlist_count(char **list)
+{
+	size_t n = 0;
+	while (list && list[n])
+		n++;
+	return n;
+}
+
+/* Process one pending list job; returns false if there was none. */
+static bool work_one_list(void)
+{
+	char *key = NULL, *url = NULL;
+
+	pthread_mutex_lock(&f.mutex);
+	for (size_t i = 0; i < f.lists.num; i++) {
+		struct list_entry *l = &f.lists.array[i];
+		if (!l->running && (l->state == YT_FETCH_PENDING || l->refresh)) {
+			l->running = true;
+			l->refresh = false;
+			key = bstrdup(l->key);
+			url = bstrdup(l->url);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&f.mutex);
+
+	if (!key)
+		return false;
+
+	char *path = list_file_for(key);
+	char **urls = NULL;
+	uint64_t t0 = os_gettime_ns();
+	FETCH_LOG(LOG_INFO, "Expanding playlist %s", url);
+	bool ok = run_list_job(url, path, &urls);
+	if (ok)
+		FETCH_LOG(LOG_INFO, "Playlist %s: %zu video(s) in %.1fs", url, strlist_count(urls),
+			  (double)(os_gettime_ns() - t0) / 1e9);
+
+	pthread_mutex_lock(&f.mutex);
+	struct list_entry *l = find_list(key);
+	if (l) {
+		l->running = false;
+		if (ok) {
+			bool same = l->state == YT_FETCH_READY && strlist_count(l->urls) == strlist_count(urls);
+			for (size_t i = 0; same && urls[i]; i++)
+				same = strcmp(l->urls[i], urls[i]) == 0;
+
+			l->fetched_ns = os_gettime_ns();
+			if (!same) {
+				strlist_free(l->urls);
+				l->urls = urls;
+				urls = NULL;
+				l->state = YT_FETCH_READY;
+				l->generation++; /* only signal sources on real changes */
+			}
+		} else if (l->state != YT_FETCH_READY) {
+			/* keep serving a previous (disk) copy if the refresh failed */
+			l->state = YT_FETCH_FAILED;
+			l->generation++;
+		}
+	}
+	pthread_mutex_unlock(&f.mutex);
+
+	strlist_free(urls);
+	bfree(path);
+	bfree(key);
+	bfree(url);
+	return true;
+}
+
 static struct fetch_entry *find_entry(const char *key)
 {
 	for (size_t i = 0; i < f.entries.num; i++)
@@ -508,6 +692,12 @@ static void *worker(void *unused)
 
 		if (os_atomic_exchange_bool(&f.evict_requested, false))
 			cache_evict();
+
+		/* playlist expansion unblocks playback: always before downloads */
+		if (work_one_list()) {
+			os_sem_post(f.sem); /* a download may still be waiting */
+			continue;
+		}
 
 		pthread_mutex_lock(&f.mutex);
 		for (size_t i = 0; i < f.entries.num; i++) {
@@ -562,6 +752,7 @@ void yt_fetcher_init(void)
 	pthread_mutex_init(&f.mutex, NULL);
 	os_sem_init(&f.sem, 0);
 	da_init(f.entries);
+	da_init(f.lists);
 
 	f.cache_limit = DEFAULT_CACHE_LIMIT;
 	f.cache_dir = obs_module_config_path("cache");
@@ -588,6 +779,12 @@ void yt_fetcher_free(void)
 		bfree(f.entries.array[i].path);
 	}
 	da_free(f.entries);
+	for (size_t i = 0; i < f.lists.num; i++) {
+		bfree(f.lists.array[i].key);
+		bfree(f.lists.array[i].url);
+		strlist_free(f.lists.array[i].urls);
+	}
+	da_free(f.lists);
 	os_sem_destroy(f.sem);
 	pthread_mutex_destroy(&f.mutex);
 	bfree(f.cache_dir);
@@ -662,4 +859,92 @@ void yt_fetcher_set_cache_limit(long long bytes)
 		if (f.thread_ok)
 			os_sem_post(f.sem);
 	}
+}
+
+bool yt_fetcher_is_collection(const char *url)
+{
+	if (!yt_fetcher_is_remote(url))
+		return false;
+	if (!strstr(url, "youtube.com"))
+		return false;
+	if (strstr(url, "list=") && !strstr(url, "v="))
+		return true;
+	return strstr(url, "/@") || strstr(url, "/channel/") || strstr(url, "/c/") || strstr(url, "/user/");
+}
+
+static struct list_entry *get_list_locked(const char *url)
+{
+	struct dstr key = {0};
+	dstr_printf(&key, "list-%016llx", (unsigned long long)fnv1a(url));
+
+	struct list_entry *l = find_list(key.array);
+	if (!l) {
+		l = da_push_back_new(f.lists);
+		l->key = bstrdup(key.array);
+		l->url = bstrdup(url);
+		l->state = YT_FETCH_PENDING;
+
+		/* serve the copy saved by a previous session right away, and
+		 * refresh it in the background */
+		char *path = list_file_for(key.array);
+		char *text = os_quick_read_utf8_file(path);
+		if (text && *text) {
+			l->urls = strlist_split(text, '\n', false);
+			l->state = YT_FETCH_READY;
+			l->generation = 1;
+			l->refresh = true;
+		}
+		bfree(text);
+		bfree(path);
+		os_sem_post(f.sem);
+	} else if (l->state == YT_FETCH_READY && !l->running && !l->refresh && l->fetched_ns &&
+		   os_gettime_ns() - l->fetched_ns > LIST_REFRESH_NS) {
+		l->refresh = true;
+		os_sem_post(f.sem);
+	}
+	dstr_free(&key);
+	return l;
+}
+
+uint32_t yt_fetcher_list_generation(const char *url)
+{
+	pthread_mutex_lock(&f.mutex);
+	uint32_t gen = get_list_locked(url)->generation;
+	pthread_mutex_unlock(&f.mutex);
+	return gen;
+}
+
+enum yt_fetch_state yt_fetcher_request_list(const char *url, char ***urls_out, uint32_t *generation)
+{
+	pthread_mutex_lock(&f.mutex);
+	struct list_entry *l = get_list_locked(url);
+	enum yt_fetch_state state = l->state;
+	if (generation)
+		*generation = l->generation;
+	if (urls_out) {
+		*urls_out = NULL;
+		if (state == YT_FETCH_READY) {
+			/* strlist is a single allocation: rebuild it via split */
+			struct dstr joined = {0};
+			for (char **u = l->urls; u && *u; u++) {
+				dstr_cat(&joined, *u);
+				dstr_cat(&joined, "\n");
+			}
+			*urls_out = strlist_split(joined.array ? joined.array : "", '\n', false);
+			dstr_free(&joined);
+		}
+	}
+	pthread_mutex_unlock(&f.mutex);
+	return state;
+}
+
+void yt_fetcher_refresh_list(const char *url)
+{
+	pthread_mutex_lock(&f.mutex);
+	struct list_entry *l = get_list_locked(url);
+	if (!l->running) {
+		l->refresh = true;
+		os_sem_post(f.sem);
+	}
+	pthread_mutex_unlock(&f.mutex);
 }

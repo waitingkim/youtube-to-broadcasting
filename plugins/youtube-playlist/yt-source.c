@@ -23,6 +23,7 @@
 #include <util/platform.h>
 #include <util/darray.h>
 #include <util/bmem.h>
+#include <util/dstr.h>
 #include <string.h>
 #include <media-playback/media-playback.h>
 
@@ -64,7 +65,12 @@ struct yt_source {
 	pthread_mutex_t mutex;
 
 	/* settings */
-	DARRAY(char *) items;
+	DARRAY(char *) raw;   /* entries as entered by the user */
+	DARRAY(char *) items; /* playable entries (playlists expanded) */
+	DARRAY(uint32_t) list_gens; /* per raw entry: list generation used (0 = n/a) */
+	bool has_lists;
+	bool lists_pending; /* some playlist is still being expanded */
+	float list_check_t;
 	bool loop;
 	bool hw_decode;
 	int max_height;
@@ -262,6 +268,12 @@ static void start_initial_locked(struct yt_source *s)
 			ms = s->resume_ms;
 		}
 	}
+	/* Wait until every playlist is expanded, otherwise playback would start
+	 * in the wrong place (items of a later playlist before an earlier one).
+	 * apply_items_locked calls us again when they arrive. */
+	if (!s->items.num || s->lists_pending)
+		return;
+
 	bfree(s->resume_item);
 	s->resume_item = NULL;
 
@@ -470,14 +482,24 @@ static const char *yt_get_name(void *unused)
 	return T_("YouTubePlaylist");
 }
 
+static bool lists_changed_locked(struct yt_source *s);
+static void apply_items_locked(struct yt_source *s, bool restart);
+
 static void yt_tick(void *data, float seconds)
 {
-	UNUSED_PARAMETER(seconds);
 	struct yt_source *s = data;
 	struct yt_player *trash[2] = {NULL, NULL};
 	bool started, ended, clear;
 
 	pthread_mutex_lock(&s->mutex);
+	if (s->has_lists) {
+		s->list_check_t += seconds;
+		if (s->list_check_t >= 0.5f) {
+			s->list_check_t = 0.0f;
+			if (lists_changed_locked(s))
+				apply_items_locked(s, false);
+		}
+	}
 	if (!s->pending) {
 		pthread_mutex_unlock(&s->mutex);
 		return;
@@ -528,14 +550,18 @@ static void yt_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_CACHE_LIMIT, 10);
 }
 
+static bool refresh_lists_clicked(obs_properties_t *props, obs_property_t *prop, void *data);
+
 static obs_properties_t *yt_properties(void *data)
 {
-	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_editable_list(props, S_PLAYLIST, T_("Playlist"), OBS_EDITABLE_LIST_TYPE_FILES_AND_URLS,
 					 "Media Files (*.mp4 *.m4v *.mov *.mkv *.webm *.ts *.flv);;All Files (*.*)",
 					 NULL);
+	obs_property_t *pl = obs_properties_get(props, S_PLAYLIST);
+	obs_property_set_long_description(pl, T_("Playlist.Description"));
+	obs_properties_add_button2(props, "refresh_lists", T_("RefreshPlaylists"), refresh_lists_clicked, data);
 	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
 
 	obs_property_t *h = obs_properties_add_list(props, S_MAX_HEIGHT, T_("MaxHeight"), OBS_COMBO_TYPE_LIST,
@@ -563,41 +589,80 @@ static void free_items(struct yt_source *s)
 	da_free(s->items);
 }
 
-static void yt_update(void *data, obs_data_t *settings)
+static void free_raw(struct yt_source *s)
 {
-	struct yt_source *s = data;
-	obs_data_array_t *array = obs_data_get_array(settings, S_PLAYLIST);
-	size_t count = obs_data_array_count(array);
+	for (size_t i = 0; i < s->raw.num; i++)
+		bfree(s->raw.array[i]);
+	da_free(s->raw);
+	da_free(s->list_gens);
+}
 
-	pthread_mutex_lock(&s->mutex);
+/* Rebuild s->items from s->raw, expanding playlists/channels that the
+ * fetcher has already resolved (others are queued and contribute nothing
+ * yet; yt_tick notices when they arrive). */
+static void expand_items_locked(struct yt_source *s)
+{
+	free_items(s);
+	da_resize(s->list_gens, s->raw.num);
+	s->has_lists = false;
+	s->lists_pending = false;
 
+	for (size_t i = 0; i < s->raw.num; i++) {
+		const char *entry = s->raw.array[i];
+		s->list_gens.array[i] = 0;
+
+		if (!yt_fetcher_is_collection(entry)) {
+			char *copy = bstrdup(entry);
+			da_push_back(s->items, &copy);
+			continue;
+		}
+
+		s->has_lists = true;
+		char **urls = NULL;
+		uint32_t gen = 0;
+		enum yt_fetch_state st = yt_fetcher_request_list(entry, &urls, &gen);
+		s->list_gens.array[i] = gen;
+
+		if (st == YT_FETCH_READY) {
+			for (char **u = urls; u && *u; u++) {
+				char *copy = bstrdup(*u);
+				da_push_back(s->items, &copy);
+			}
+		} else if (st == YT_FETCH_FAILED) {
+			YT_LOG(LOG_WARNING, "Playlist could not be loaded: %s", entry);
+		} else {
+			s->lists_pending = true;
+		}
+		strlist_free(urls);
+	}
+}
+
+/* true if any playlist changed since expand_items_locked */
+static bool lists_changed_locked(struct yt_source *s)
+{
+	for (size_t i = 0; i < s->raw.num; i++) {
+		if (!yt_fetcher_is_collection(s->raw.array[i]))
+			continue;
+		if (yt_fetcher_list_generation(s->raw.array[i]) != s->list_gens.array[i])
+			return true;
+	}
+	return false;
+}
+
+/* Re-expand the playlist and reconcile playback with the new item list. */
+static void apply_items_locked(struct yt_source *s, bool restart)
+{
 	char *cur_path = (s->cur >= 0 && s->cur_index < s->items.num) ? bstrdup(s->items.array[s->cur_index])
 								     : NULL;
 	bool was_running = s->state == OBS_MEDIA_STATE_PLAYING || s->state == OBS_MEDIA_STATE_PAUSED;
+	size_t old_count = s->items.num;
 
-	free_items(s);
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(array, i);
-		const char *path = obs_data_get_string(item, "value");
-		if (path && *path) {
-			char *copy = bstrdup(path);
-			da_push_back(s->items, &copy);
-		}
-		obs_data_release(item);
-	}
-
-	bool hw_changed = s->hw_decode != obs_data_get_bool(settings, S_HW_DECODE);
-	s->loop = obs_data_get_bool(settings, S_LOOP);
-	s->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
-	s->max_height = (int)obs_data_get_int(settings, S_MAX_HEIGHT);
-	if (s->max_height <= 0)
-		s->max_height = 1080;
-	s->resume = obs_data_get_bool(settings, S_RESUME);
-	s->clear_on_wait = obs_data_get_bool(settings, S_CLEAR_ON_WAIT);
-	yt_fetcher_set_cache_limit(obs_data_get_int(settings, S_CACHE_LIMIT) * 1024LL * 1024LL * 1024LL);
+	expand_items_locked(s);
+	if (s->items.num != old_count)
+		YT_LOG(LOG_INFO, "Playlist now has %zu item(s)", s->items.num);
 
 	if (was_running) {
-		if (hw_changed || !s->items.num) {
+		if (restart || !s->items.num) {
 			start_at_locked(s, 0);
 		} else {
 			/* keep the current item playing; re-resolve its position and
@@ -622,10 +687,57 @@ static void yt_update(void *data, obs_data_t *settings)
 		start_initial_locked(s);
 	}
 
-	pthread_mutex_unlock(&s->mutex);
-
 	bfree(cur_path);
+}
+
+static void yt_update(void *data, obs_data_t *settings)
+{
+	struct yt_source *s = data;
+	obs_data_array_t *array = obs_data_get_array(settings, S_PLAYLIST);
+	size_t count = obs_data_array_count(array);
+
+	pthread_mutex_lock(&s->mutex);
+
+	free_raw(s);
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(array, i);
+		const char *path = obs_data_get_string(item, "value");
+		if (path && *path) {
+			char *copy = bstrdup(path);
+			da_push_back(s->raw, &copy);
+		}
+		obs_data_release(item);
+	}
+
+	bool hw_changed = s->hw_decode != obs_data_get_bool(settings, S_HW_DECODE);
+	s->loop = obs_data_get_bool(settings, S_LOOP);
+	s->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
+	s->max_height = (int)obs_data_get_int(settings, S_MAX_HEIGHT);
+	if (s->max_height <= 0)
+		s->max_height = 1080;
+	s->resume = obs_data_get_bool(settings, S_RESUME);
+	s->clear_on_wait = obs_data_get_bool(settings, S_CLEAR_ON_WAIT);
+	yt_fetcher_set_cache_limit(obs_data_get_int(settings, S_CACHE_LIMIT) * 1024LL * 1024LL * 1024LL);
+
+	apply_items_locked(s, hw_changed);
+
+	pthread_mutex_unlock(&s->mutex);
 	obs_data_array_release(array);
+}
+
+static bool refresh_lists_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+	struct yt_source *s = data;
+	if (!s)
+		return false;
+	pthread_mutex_lock(&s->mutex);
+	for (size_t i = 0; i < s->raw.num; i++)
+		if (yt_fetcher_is_collection(s->raw.array[i]))
+			yt_fetcher_refresh_list(s->raw.array[i]);
+	pthread_mutex_unlock(&s->mutex);
+	return false;
 }
 
 static void yt_activate(void *data)
@@ -664,6 +776,8 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	s->waiting_for = NO_INDEX;
 	pthread_mutex_init(&s->mutex, NULL);
 	da_init(s->items);
+	da_init(s->raw);
+	da_init(s->list_gens);
 
 	const char *resume_item = obs_data_get_string(settings, S_RESUME_ITEM);
 	if (resume_item && *resume_item) {
@@ -692,6 +806,7 @@ static void yt_destroy(void *data)
 	free_player(b);
 
 	free_items(s);
+	free_raw(s);
 	bfree(s->resume_item);
 	pthread_mutex_destroy(&s->mutex);
 	bfree(s);

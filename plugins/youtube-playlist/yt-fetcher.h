@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Background downloader shared by all youtube-playlist sources.
  *
@@ -27,3 +28,19 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 
 /* Cache size limit in bytes (LRU eviction after each download); 0 = none. */
 void yt_fetcher_set_cache_limit(long long bytes);
+
+/* Playlists and channels -------------------------------------------------- */
+
+/* true for YouTube playlist (list= without v=) and channel URLs */
+bool yt_fetcher_is_collection(const char *url);
+
+/* Non-blocking.  Queues expansion if unknown.  When READY, *urls_out receives
+ * a strlist copy of the video URLs (free with strlist_free).  `generation`
+ * changes whenever the list content/state changes. */
+enum yt_fetch_state yt_fetcher_request_list(const char *url, char ***urls_out, uint32_t *generation);
+
+/* Cheap change detection (also queues expansion if unknown). */
+uint32_t yt_fetcher_list_generation(const char *url);
+
+/* Re-expand the playlist in the background. */
+void yt_fetcher_refresh_list(const char *url);
