@@ -21,8 +21,9 @@ endif()
 
 # Ensure recent enough Xcode and platform SDK
 function(check_sdk_requirements)
-  set(obs_macos_minimum_sdk 26.5) # Keep in sync with Xcode
-  set(obs_macos_minimum_xcode 26.5) # Keep in sync with SDK
+  # Lowered from 26.5 for this fork: builds and runs fine with Xcode 26.4.1.
+  set(obs_macos_minimum_sdk 26.4) # Keep in sync with Xcode
+  set(obs_macos_minimum_xcode 26.4) # Keep in sync with SDK
   execute_process(
     COMMAND xcrun --sdk macosx --show-sdk-platform-version
     OUTPUT_VARIABLE obs_macos_current_sdk
