@@ -116,5 +116,6 @@ add_core_module(vlc-video WITH_MESSAGE)
 add_core_module(win-capture PLATFORMS WINDOWS)
 add_core_module(win-dshow PLATFORMS WINDOWS)
 add_core_module(win-wasapi PLATFORMS WINDOWS)
+add_core_module(youtube-playlist)
 
 set_obs_core_modules()
