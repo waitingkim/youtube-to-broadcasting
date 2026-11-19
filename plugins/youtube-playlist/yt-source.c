@@ -37,6 +37,20 @@
 #define S_CLEAR_ON_WAIT "clear_on_wait"
 #define S_CACHE_LIMIT "cache_limit_gb"
 
+/* relay input (live input with playlist fallback) */
+#define S_RELAY "relay_enabled"
+#define S_RELAY_URL "relay_url"
+#define S_RELAY_OPTS "relay_ffmpeg_options"
+#define S_RELAY_FAILOVER "relay_failover_ms"
+#define S_RELAY_RETURN "relay_return_ms"
+#define S_RELAY_PAUSE "relay_pause_playlist"
+
+enum relay_mode {
+	RELAY_AUTO,     /* live while the input is healthy, playlist otherwise */
+	RELAY_LIVE,     /* force the live input */
+	RELAY_PLAYLIST, /* force the playlist */
+};
+
 /* saved by yt_save (not shown in properties) */
 #define S_RESUME_ITEM "resume_item"
 #define S_RESUME_INDEX "resume_index"
@@ -105,6 +119,27 @@ struct yt_source {
 	bool waiting;       /* nothing playing: waiting for a download */
 	float error_t;      /* seconds spent in OBS_MEDIA_STATE_ERROR */
 	bool emit_clear;    /* clear the video while waiting */
+
+	/* relay input: a network input (SRT/RTMP/...) that takes over the
+	 * output while it delivers frames; the playlist is the fallback */
+	bool relay_enabled;
+	char *relay_url;
+	char *relay_opts;
+	uint64_t relay_failover_ns;
+	uint64_t relay_return_ns;
+	bool relay_pause_playlist;
+	enum relay_mode relay_mode;
+	media_playback_t *relay_mp;
+	bool relay_restart;              /* settings changed: reopen now */
+	float relay_retry_t;             /* seconds until the next reopen */
+	volatile bool relay_dead;        /* input ended/failed (media thread) */
+	volatile uint64_t relay_last_ns; /* last frame/packet from the input */
+	uint64_t relay_burst_ns;         /* start of the current run of frames */
+	volatile bool relay_on_air;      /* the input is what we output */
+	bool relay_paused_playlist;      /* we paused the playlist for it */
+	char *relay_opts_live;           /* options string handed to the input */
+	int relay_failures;              /* consecutive opens without any frame */
+	bool relay_got_frames;           /* current input delivered something */
 };
 
 enum item_res {
@@ -194,6 +229,11 @@ static void begin_player_locked(struct yt_source *s, int slot)
 	}
 	s->seek_ms = 0;
 	s->waiting = false;
+
+	if (s->relay_on_air && s->relay_pause_playlist) {
+		media_playback_play_pause(p->mp, true);
+		s->relay_paused_playlist = true;
+	}
 
 	s->emit_started = true;
 	s->pending = true;
@@ -296,13 +336,15 @@ static void yt_video_cb(void *opaque, struct obs_source_frame *frame)
 	if (!os_atomic_load_bool(&p->active))
 		return;
 	os_atomic_set_bool(&p->got_output, true);
+	if (os_atomic_load_bool(&p->s->relay_on_air))
+		return; /* the relay input owns the output */
 	obs_source_output_video(p->s->source, frame);
 }
 
 static void yt_seek_cb(void *opaque, struct obs_source_frame *frame)
 {
 	struct yt_player *p = opaque;
-	if (!os_atomic_load_bool(&p->active))
+	if (!os_atomic_load_bool(&p->active) || os_atomic_load_bool(&p->s->relay_on_air))
 		return;
 	obs_source_set_video_frame(p->s->source, frame);
 }
@@ -313,6 +355,8 @@ static void yt_audio_cb(void *opaque, struct obs_source_audio *audio)
 	if (!os_atomic_load_bool(&p->active))
 		return;
 	os_atomic_set_bool(&p->got_output, true);
+	if (os_atomic_load_bool(&p->s->relay_on_air))
+		return;
 	obs_source_output_audio(p->s->source, audio);
 }
 
@@ -501,6 +545,190 @@ static const char *yt_get_name(void *unused)
 	return T_("YouTubePlaylist");
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* relay input                                                               */
+
+static void relay_video_cb(void *opaque, struct obs_source_frame *frame)
+{
+	struct yt_source *s = opaque;
+	s->relay_last_ns = os_gettime_ns();
+	s->relay_got_frames = true;
+	if (os_atomic_load_bool(&s->relay_on_air))
+		obs_source_output_video(s->source, frame);
+}
+
+static void relay_audio_cb(void *opaque, struct obs_source_audio *audio)
+{
+	struct yt_source *s = opaque;
+	s->relay_last_ns = os_gettime_ns();
+	s->relay_got_frames = true;
+	if (os_atomic_load_bool(&s->relay_on_air))
+		obs_source_output_audio(s->source, audio);
+}
+
+static void relay_stop_cb(void *opaque)
+{
+	struct yt_source *s = opaque;
+	os_atomic_set_bool(&s->relay_dead, true);
+}
+
+/* Destroying joins the input thread; relay callbacks never take s->mutex,
+ * so this is safe with the mutex held. */
+static void relay_close_locked(struct yt_source *s)
+{
+	if (s->relay_mp) {
+		media_playback_destroy(s->relay_mp);
+		s->relay_mp = NULL;
+	}
+	os_atomic_set_bool(&s->relay_dead, false);
+	s->relay_last_ns = 0;
+	s->relay_burst_ns = 0;
+}
+
+static void relay_open_locked(struct yt_source *s)
+{
+	struct dstr opts = {0};
+	dstr_copy(&opts, s->relay_opts ? s->relay_opts : "");
+
+	/* "rtmp://0.0.0.0:1935/..." means: accept a publisher (FFmpeg's
+	 * built-in RTMP server mode) */
+	if (astrcmpi_n(s->relay_url, "rtmp://", 7) == 0 && strstr(s->relay_url, "0.0.0.0") &&
+	    !strstr(opts.array ? opts.array : "", "listen")) {
+		if (opts.len)
+			dstr_cat(&opts, " ");
+		dstr_cat(&opts, "listen=1");
+	}
+
+	struct mp_media_info info = {
+		.opaque = s,
+		.v_cb = relay_video_cb,
+		.a_cb = relay_audio_cb,
+		.stop_cb = relay_stop_cb,
+		.path = s->relay_url,
+		.ffmpeg_options = opts.len ? opts.array : NULL,
+		.speed = 100,
+		.force_range = VIDEO_RANGE_DEFAULT,
+		.hardware_decoding = s->hw_decode,
+		.is_local_file = false,
+		.buffering = 1024 * 1024,
+	};
+	s->relay_mp = media_playback_create(&info);
+	if (s->relay_mp)
+		media_playback_play(s->relay_mp, false, false);
+	else
+		s->relay_retry_t = 2.0f;
+	/* media-playback keeps the options pointer: keep the string alive */
+	bfree(s->relay_opts_live);
+	s->relay_opts_live = opts.array;
+}
+
+static void relay_set_on_air_locked(struct yt_source *s, bool on_air)
+{
+	os_atomic_set_bool(&s->relay_on_air, on_air);
+
+	/* The input and the playlist run on different clocks (a network input
+	 * usually runs ahead after its initial burst).  libobs would hold or
+	 * drop the new side's frames until their timestamps line up, freezing
+	 * the picture for up to ~2 s.  Flushing the async video queue (after
+	 * switching the gate above) resets that timing, so the new side shows
+	 * immediately. */
+	obs_source_output_video(s->source, NULL);
+
+	if (on_air) {
+		YT_LOG(LOG_INFO, "Relay: live input on air (%s)", s->relay_url);
+		if (s->relay_pause_playlist && s->cur >= 0 && s->state == OBS_MEDIA_STATE_PLAYING) {
+			media_playback_play_pause(s->slots[s->cur]->mp, true);
+			s->relay_paused_playlist = true;
+		}
+	} else {
+		YT_LOG(LOG_INFO, "Relay: back to the playlist");
+		if (s->relay_paused_playlist && s->cur >= 0)
+			media_playback_play_pause(s->slots[s->cur]->mp, false);
+		s->relay_paused_playlist = false;
+	}
+}
+
+static void relay_tick_locked(struct yt_source *s, float seconds)
+{
+	if (!s->relay_enabled || !s->relay_url || !*s->relay_url) {
+		if (s->relay_mp)
+			relay_close_locked(s);
+		if (os_atomic_load_bool(&s->relay_on_air))
+			relay_set_on_air_locked(s, false);
+		return;
+	}
+
+	if (s->relay_restart || os_atomic_load_bool(&s->relay_dead)) {
+		bool restart = s->relay_restart;
+		float delay = 1.0f;
+		if (restart) {
+			s->relay_failures = 0;
+			delay = 0.0f;
+		} else if (s->relay_got_frames) {
+			YT_LOG(LOG_INFO, "Relay: input ended, waiting for it again");
+			s->relay_failures = 0;
+		} else {
+			/* could not open / nothing received: back off up to 10 s and
+			 * say it once instead of every second */
+			if (s->relay_failures == 0)
+				YT_LOG(LOG_WARNING,
+				       "Relay: cannot open input '%s' (port already in use, wrong URL, or "
+				       "the sender is not reachable); retrying",
+				       s->relay_url);
+			s->relay_failures++;
+			delay = s->relay_failures >= 4 ? 10.0f : (float)(1 << s->relay_failures);
+		}
+		relay_close_locked(s);
+		s->relay_got_frames = false;
+		s->relay_retry_t = delay;
+		s->relay_restart = false;
+	}
+	if (!s->relay_mp) {
+		s->relay_retry_t -= seconds;
+		if (s->relay_retry_t <= 0.0f)
+			relay_open_locked(s);
+	}
+
+	uint64_t now = os_gettime_ns();
+	uint64_t last = s->relay_last_ns;
+	bool receiving = last && now - last < s->relay_failover_ns;
+	if (!receiving)
+		s->relay_burst_ns = 0;
+	else if (!s->relay_burst_ns)
+		s->relay_burst_ns = now;
+
+	bool on_air = os_atomic_load_bool(&s->relay_on_air);
+	bool want;
+	switch (s->relay_mode) {
+	case RELAY_LIVE:
+		want = true;
+		break;
+	case RELAY_PLAYLIST:
+		want = false;
+		break;
+	default:
+		/* go live once the input has been stable for a moment, fall
+		 * back as soon as it stops delivering */
+		want = on_air ? receiving : (receiving && now - s->relay_burst_ns >= s->relay_return_ns);
+		break;
+	}
+	if (want != on_air)
+		relay_set_on_air_locked(s, want);
+}
+
+static const char *relay_state_locked(struct yt_source *s)
+{
+	if (!s->relay_enabled || !s->relay_url || !*s->relay_url)
+		return "off";
+	if (os_atomic_load_bool(&s->relay_on_air))
+		return "on_air";
+	uint64_t last = s->relay_last_ns;
+	if (last && os_gettime_ns() - last < s->relay_failover_ns)
+		return "receiving";
+	return "waiting";
+}
+
 static bool lists_changed_locked(struct yt_source *s);
 static void apply_items_locked(struct yt_source *s, bool restart);
 
@@ -511,6 +739,11 @@ static void yt_tick(void *data, float seconds)
 	bool started, ended, clear;
 
 	pthread_mutex_lock(&s->mutex);
+	relay_tick_locked(s, seconds);
+	if (s->emit_clear && os_atomic_load_bool(&s->relay_on_air))
+		s->emit_clear = false;
+	if (s->emit_clear)
+		s->pending = true;
 	if (s->state == OBS_MEDIA_STATE_ERROR && s->items.num) {
 		/* every item failed (network down?): try again every 30 s; failed
 		 * downloads are retried by the fetcher after a while */
@@ -561,12 +794,14 @@ static void yt_tick(void *data, float seconds)
 	s->emit_clear = false;
 	pthread_mutex_unlock(&s->mutex);
 
-	if (clear)
+	bool relay_live = os_atomic_load_bool(&s->relay_on_air);
+	if (clear && !relay_live)
 		obs_source_output_video(s->source, NULL);
 	if (started)
 		obs_source_media_started(s->source);
 	if (ended) {
-		obs_source_output_video(s->source, NULL);
+		if (!relay_live)
+			obs_source_output_video(s->source, NULL);
 		obs_source_media_ended(s->source);
 	}
 }
@@ -579,6 +814,11 @@ static void yt_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_RESUME, true);
 	obs_data_set_default_bool(settings, S_CLEAR_ON_WAIT, true);
 	obs_data_set_default_int(settings, S_CACHE_LIMIT, 10);
+	obs_data_set_default_bool(settings, S_RELAY, false);
+	obs_data_set_default_string(settings, S_RELAY_URL, "srt://0.0.0.0:9000?mode=listener");
+	obs_data_set_default_int(settings, S_RELAY_FAILOVER, 2000);
+	obs_data_set_default_int(settings, S_RELAY_RETURN, 3000);
+	obs_data_set_default_bool(settings, S_RELAY_PAUSE, true);
 }
 
 static bool refresh_lists_clicked(obs_properties_t *props, obs_property_t *prop, void *data);
@@ -619,6 +859,20 @@ static obs_properties_t *yt_properties(void *data)
 	obs_property_t *c = obs_properties_add_int(props, S_CACHE_LIMIT, T_("CacheLimit"), 1, 2000, 1);
 	obs_property_int_set_suffix(c, " GB");
 	obs_properties_add_button2(props, "update_ytdlp", T_("UpdateYtdlp"), update_ytdlp_clicked, NULL);
+
+	obs_properties_t *relay = obs_properties_create();
+	obs_property_t *url = obs_properties_add_text(relay, S_RELAY_URL, T_("Relay.Url"), OBS_TEXT_DEFAULT);
+	obs_property_set_long_description(url, T_("Relay.Url.Description"));
+	obs_property_t *opts = obs_properties_add_text(relay, S_RELAY_OPTS, T_("Relay.Options"), OBS_TEXT_DEFAULT);
+	obs_property_set_long_description(opts, T_("Relay.Options.Description"));
+	obs_property_t *fo = obs_properties_add_int(relay, S_RELAY_FAILOVER, T_("Relay.Failover"), 200, 60000, 100);
+	obs_property_int_set_suffix(fo, " ms");
+	obs_property_set_long_description(fo, T_("Relay.Failover.Description"));
+	obs_property_t *rt = obs_properties_add_int(relay, S_RELAY_RETURN, T_("Relay.Return"), 0, 60000, 100);
+	obs_property_int_set_suffix(rt, " ms");
+	obs_property_set_long_description(rt, T_("Relay.Return.Description"));
+	obs_properties_add_bool(relay, S_RELAY_PAUSE, T_("Relay.PausePlaylist"));
+	obs_properties_add_group(props, S_RELAY, T_("Relay"), OBS_GROUP_CHECKABLE, relay);
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	return props;
 }
@@ -763,6 +1017,21 @@ static void yt_update(void *data, obs_data_t *settings)
 		s->max_height = 1080;
 	s->resume = obs_data_get_bool(settings, S_RESUME);
 	s->clear_on_wait = obs_data_get_bool(settings, S_CLEAR_ON_WAIT);
+
+	bool relay_enabled = obs_data_get_bool(settings, S_RELAY);
+	const char *relay_url = obs_data_get_string(settings, S_RELAY_URL);
+	const char *relay_opts = obs_data_get_string(settings, S_RELAY_OPTS);
+	if (relay_enabled != s->relay_enabled || strcmp(relay_url, s->relay_url ? s->relay_url : "") != 0 ||
+	    strcmp(relay_opts, s->relay_opts ? s->relay_opts : "") != 0 || hw_changed)
+		s->relay_restart = true;
+	s->relay_enabled = relay_enabled;
+	bfree(s->relay_url);
+	s->relay_url = bstrdup(relay_url);
+	bfree(s->relay_opts);
+	s->relay_opts = bstrdup(relay_opts);
+	s->relay_failover_ns = (uint64_t)obs_data_get_int(settings, S_RELAY_FAILOVER) * 1000000ULL;
+	s->relay_return_ns = (uint64_t)obs_data_get_int(settings, S_RELAY_RETURN) * 1000000ULL;
+	s->relay_pause_playlist = obs_data_get_bool(settings, S_RELAY_PAUSE);
 	yt_fetcher_set_cache_limit(obs_data_get_int(settings, S_CACHE_LIMIT) * 1024LL * 1024LL * 1024LL);
 
 	apply_items_locked(s, hw_changed);
@@ -854,6 +1123,16 @@ static void proc_get_queue(void *data, calldata_t *cd)
 	obs_data_set_int(root, "current", s->cur >= 0 ? (long long)s->cur_index : -1);
 	obs_data_set_bool(root, "lists_pending", s->lists_pending);
 	obs_data_set_bool(root, "loop", s->loop);
+	{
+		obs_data_t *relay = obs_data_create();
+		static const char *modes[] = {"auto", "live", "playlist"};
+		obs_data_set_bool(relay, "enabled", s->relay_enabled);
+		obs_data_set_string(relay, "state", relay_state_locked(s));
+		obs_data_set_string(relay, "mode", modes[s->relay_mode]);
+		obs_data_set_string(relay, "url", s->relay_url ? s->relay_url : "");
+		obs_data_set_obj(root, "relay", relay);
+		obs_data_release(relay);
+	}
 
 	for (size_t i = 0; i < s->items.num; i++) {
 		const char *entry = s->items.array[i];
@@ -920,6 +1199,23 @@ static void proc_play_index(void *data, calldata_t *cd)
 	pthread_mutex_unlock(&s->mutex);
 }
 
+/* void relay_set_mode(in string mode)  -- "auto", "live" or "playlist" */
+static void proc_relay_set_mode(void *data, calldata_t *cd)
+{
+	struct yt_source *s = data;
+	const char *mode = calldata_string(cd, "mode");
+	pthread_mutex_lock(&s->mutex);
+	enum relay_mode m = RELAY_AUTO;
+	if (mode && strcmp(mode, "live") == 0)
+		m = RELAY_LIVE;
+	else if (mode && strcmp(mode, "playlist") == 0)
+		m = RELAY_PLAYLIST;
+	if (m != s->relay_mode)
+		YT_LOG(LOG_INFO, "Relay mode: %s", mode ? mode : "auto");
+	s->relay_mode = m;
+	pthread_mutex_unlock(&s->mutex);
+}
+
 /* void refresh_lists() */
 static void proc_refresh_lists(void *data, calldata_t *cd)
 {
@@ -955,6 +1251,7 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	proc_handler_add(ph, "void get_queue(out string json)", proc_get_queue, s);
 	proc_handler_add(ph, "void play_index(in int index)", proc_play_index, s);
 	proc_handler_add(ph, "void refresh_lists()", proc_refresh_lists, s);
+	proc_handler_add(ph, "void relay_set_mode(in string mode)", proc_relay_set_mode, s);
 	return s;
 }
 
@@ -972,6 +1269,11 @@ static void yt_destroy(void *data)
 
 	free_player(a);
 	free_player(b);
+
+	relay_close_locked(s); /* no other thread uses the source any more */
+	bfree(s->relay_url);
+	bfree(s->relay_opts);
+	bfree(s->relay_opts_live);
 
 	free_items(s);
 	free_raw(s);

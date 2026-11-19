@@ -40,6 +40,7 @@ private slots:
 	void LoopToggled(bool checked);
 	void SelectionChanged();
 	void OpenMyPlaylists();
+	void SetRelayMode(const char *mode);
 
 private:
 	void UpdateSourceList();
@@ -70,10 +71,16 @@ private:
 	QPushButton *downButton;
 	QPushButton *removeButton;
 	QCheckBox *loopCheck;
+	QWidget *relayRow;
+	QLabel *relayLabel;
+	QPushButton *relayAutoButton;
+	QPushButton *relayLiveButton;
+	QPushButton *relayPlaylistButton;
 	QTreeWidget *queue;
 	QTimer *timer;
 
 	QStringList shownEntries; /* entries currently in the tree */
 	QString selectEntry;      /* re-select this entry after the next rebuild */
 	QString currentTitle;
+	bool relayOnAir = false;
 };

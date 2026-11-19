@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -102,6 +103,29 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	removeButton = new QPushButton(T("Remove"), this);
 	loopCheck = new QCheckBox(T("Loop"), this);
 
+	relayRow = new QWidget(this);
+	relayLabel = new QLabel(relayRow);
+	relayLabel->setWordWrap(true);
+	relayAutoButton = new QPushButton(T("Relay.Auto"), relayRow);
+	relayLiveButton = new QPushButton(T("Relay.Live"), relayRow);
+	relayPlaylistButton = new QPushButton(T("Relay.Playlist"), relayRow);
+	relayAutoButton->setToolTip(T("Relay.Auto.Tip"));
+	relayLiveButton->setToolTip(T("Relay.Live.Tip"));
+	relayPlaylistButton->setToolTip(T("Relay.Playlist.Tip"));
+	for (QPushButton *b : {relayAutoButton, relayLiveButton, relayPlaylistButton})
+		b->setCheckable(true);
+	{
+		auto *v = new QVBoxLayout(relayRow);
+		v->setContentsMargins(0, 0, 0, 0);
+		v->addWidget(relayLabel);
+		auto *h = new QHBoxLayout;
+		h->addWidget(relayAutoButton);
+		h->addWidget(relayLiveButton);
+		h->addWidget(relayPlaylistButton);
+		v->addLayout(h);
+	}
+	relayRow->setVisible(false);
+
 	queue = new QTreeWidget(this);
 	queue->setColumnCount(4);
 	queue->setHeaderLabels({"#", T("Column.Title"), T("Column.Duration"), T("Column.Status")});
@@ -149,6 +173,7 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	layout->addWidget(nowTitle);
 	layout->addLayout(now);
 	layout->addLayout(controls);
+	layout->addWidget(relayRow);
 	layout->addWidget(queue, 1);
 	layout->addLayout(edit);
 	layout->addLayout(add);
@@ -173,6 +198,20 @@ PlaylistDock::PlaylistDock(QWidget *parent) : QWidget(parent)
 	connect(downButton, &QPushButton::clicked, this, &PlaylistDock::MoveDown);
 	connect(removeButton, &QPushButton::clicked, this, &PlaylistDock::RemoveSelected);
 	connect(loopCheck, &QCheckBox::toggled, this, &PlaylistDock::LoopToggled);
+	/* toggled (not clicked) so accessibility "toggle" actions work too;
+	 * programmatic updates below block signals */
+	connect(relayAutoButton, &QPushButton::toggled, this, [this](bool on) {
+		if (on)
+			SetRelayMode("auto");
+	});
+	connect(relayLiveButton, &QPushButton::toggled, this, [this](bool on) {
+		if (on)
+			SetRelayMode("live");
+	});
+	connect(relayPlaylistButton, &QPushButton::toggled, this, [this](bool on) {
+		if (on)
+			SetRelayMode("playlist");
+	});
 
 	for (const QKeySequence &key : {QKeySequence(Qt::Key_Delete), QKeySequence(Qt::Key_Backspace)}) {
 		auto *shortcut = new QShortcut(key, queue);
@@ -358,6 +397,29 @@ void PlaylistDock::UpdateQueue()
 	stateLabel->setText(stateText);
 	playButton->setText(state == "playing" || state == "buffering" ? T("Pause") : T("Play"));
 
+	OBSDataAutoRelease relay = obs_data_get_obj(root, "relay");
+	bool relayOn = relay && obs_data_get_bool(relay, "enabled");
+	relayRow->setVisible(relayOn);
+	if (relayOn) {
+		QString rstate = QString::fromUtf8(obs_data_get_string(relay, "state"));
+		QString mode = QString::fromUtf8(obs_data_get_string(relay, "mode"));
+		QString text = T(("Relay.State." + rstate.toStdString()).c_str());
+		if (mode != "auto")
+			text += "  ·  " + T(("Relay.Mode." + mode.toStdString()).c_str());
+		relayLabel->setText(text);
+		relayLabel->setToolTip(QString::fromUtf8(obs_data_get_string(relay, "url")));
+		const std::pair<QPushButton *, const char *> modeButtons[] = {
+			{relayAutoButton, "auto"}, {relayLiveButton, "live"}, {relayPlaylistButton, "playlist"}};
+		for (const auto &mb : modeButtons) {
+			mb.first->blockSignals(true);
+			mb.first->setChecked(mode == mb.second);
+			mb.first->blockSignals(false);
+		}
+		relayOnAir = rstate == "on_air";
+	} else {
+		relayOnAir = false;
+	}
+
 	bool loop = obs_data_get_bool(root, "loop");
 	if (loopCheck->isChecked() != loop) {
 		loopCheck->blockSignals(true);
@@ -371,6 +433,11 @@ void PlaylistDock::UpdateNowPlaying()
 	OBSSourceAutoRelease source = GetSource(SelectedSource());
 	if (!source)
 		return;
+	if (relayOnAir) {
+		nowTitle->setText(T("Relay.NowLive"));
+		nowTime->setText(currentTitle.isEmpty() ? QString() : T("Relay.PlaylistPaused").arg(currentTitle));
+		return;
+	}
 	nowTitle->setText(currentTitle.isEmpty() ? T("NothingPlaying") : currentTitle);
 
 	long long t = obs_source_media_get_time(source) / 1000;
@@ -610,4 +677,16 @@ void PlaylistDock::ShowContextMenu(const QPoint &pos)
 		menu.addAction(T("RefreshPlaylists"), this, &PlaylistDock::RefreshLists);
 	}
 	menu.exec(queue->viewport()->mapToGlobal(pos));
+}
+
+void PlaylistDock::SetRelayMode(const char *mode)
+{
+	OBSSourceAutoRelease source = GetSource(SelectedSource());
+	if (!source)
+		return;
+	calldata_t cd = {};
+	calldata_set_string(&cd, "mode", mode);
+	proc_handler_call(obs_source_get_proc_handler(source), "relay_set_mode", &cd);
+	calldata_free(&cd);
+	Refresh();
 }
