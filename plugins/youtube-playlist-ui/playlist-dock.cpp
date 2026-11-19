@@ -46,6 +46,8 @@ static QString StatusText(const char *status, long long progress)
 		return T("Status.Playing");
 	if (st == "ready")
 		return T("Status.Ready");
+	if (st == "live")
+		return T("Status.Live");
 	if (st == "downloading")
 		return T("Status.Downloading").arg(progress);
 	if (st == "queued")

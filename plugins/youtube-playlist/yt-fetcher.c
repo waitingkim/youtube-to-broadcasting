@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <utime.h>
+#include <time.h>
 #include <stdlib.h>
 
 #define FETCH_LOG(level, format, ...) blog(level, "[youtube-playlist fetcher] " format, ##__VA_ARGS__)
@@ -49,6 +50,9 @@ struct fetch_entry {
 	char *path;
 	uint64_t last_touch_ns;
 	int progress; /* 0-100 while running */
+	bool live;           /* `path` is a stream URL, not a cached file */
+	uint64_t expires_ns; /* live: re-resolve the stream URL after this */
+	uint64_t failed_ns;  /* when it failed (retried after RETRY_FAILED_NS) */
 };
 
 struct meta_entry {
@@ -66,10 +70,14 @@ struct list_entry {
 	bool refresh;         /* re-expand even though READY */
 	uint32_t generation;  /* bumped whenever `urls` or `state` changes */
 	uint64_t fetched_ns;  /* when `urls` was obtained (0 = from disk, stale) */
+	uint64_t failed_ns;
 	char **urls;          /* strlist, NULL-terminated */
 };
 
 #define LIST_REFRESH_NS (60ULL * 60ULL * 1000000000ULL) /* 1 hour */
+#define RETRY_FAILED_NS (10ULL * 60ULL * 1000000000ULL)  /* 10 minutes */
+#define LIVE_URL_TTL_NS (5ULL * 60ULL * 60ULL * 1000000000ULL) /* stream URLs expire after ~6 h */
+#define UPDATE_CHECK_S (24 * 60 * 60) /* daily yt-dlp update check */
 
 static struct {
 	pthread_mutex_t mutex;
@@ -93,6 +101,8 @@ static struct {
 
 	volatile long long cache_limit; /* bytes, 0 = unlimited */
 	volatile bool evict_requested;
+	volatile bool update_requested; /* forced yt-dlp update (UI button) */
+	char *ytdlp_version;
 } f;
 
 #define DEFAULT_CACHE_LIMIT (10LL * 1024 * 1024 * 1024)
@@ -363,6 +373,8 @@ static bool ensure_ytdlp(void)
 	if (yt_proc_run(argv, &out) == 0) {
 		dstr_depad(&out);
 		FETCH_LOG(LOG_INFO, "Using yt-dlp %s (%s)", out.array, f.ytdlp_path);
+		bfree(f.ytdlp_version);
+		f.ytdlp_version = bstrdup(out.array);
 		f.ytdlp_ready = true;
 	} else {
 		FETCH_LOG(LOG_WARNING, "yt-dlp is not runnable: %s", out.array);
@@ -370,6 +382,78 @@ static bool ensure_ytdlp(void)
 	}
 	dstr_free(&out);
 	return f.ytdlp_ready;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* yt-dlp updates                                                            */
+
+static char *latest_ytdlp_version(void)
+{
+	/* .../releases/latest redirects to .../releases/tag/<version> */
+	const char *argv[] = {CURL_BIN, "-sSI", "--max-time", "20", "https://github.com/yt-dlp/yt-dlp/releases/latest",
+			      NULL};
+	struct dstr out = {0};
+	char *version = NULL;
+	if (yt_proc_run(argv, &out) == 0 && out.array) {
+		char *tag = strstr(out.array, "/releases/tag/");
+		if (tag) {
+			tag += strlen("/releases/tag/");
+			size_t n = strcspn(tag, "\r\n \t");
+			if (n)
+				version = bstrdup_n(tag, n);
+		}
+	}
+	dstr_free(&out);
+	return version;
+}
+
+static void touch_update_marker(void)
+{
+	struct dstr marker = {0};
+	dstr_printf(&marker, "%s/last-update-check", f.bin_dir);
+	os_mkdirs(f.bin_dir);
+	os_quick_write_utf8_file(marker.array, "", 0, false);
+	dstr_free(&marker);
+}
+
+static bool update_due(void)
+{
+	struct dstr marker = {0};
+	struct stat st;
+	dstr_printf(&marker, "%s/last-update-check", f.bin_dir);
+	bool due = stat(marker.array, &st) != 0 || time(NULL) - st.st_mtime > UPDATE_CHECK_S;
+	dstr_free(&marker);
+	return due;
+}
+
+/* Install the latest yt-dlp if it is newer than ours (worker thread). */
+static void check_ytdlp_update(bool forced)
+{
+	if (!forced && !update_due())
+		return;
+	if (!ensure_ytdlp())
+		return;
+	touch_update_marker();
+
+	char *latest = latest_ytdlp_version();
+	if (!latest) {
+		FETCH_LOG(LOG_WARNING, "Could not check for yt-dlp updates");
+		return;
+	}
+	if (f.ytdlp_version && strcmp(latest, f.ytdlp_version) == 0) {
+		FETCH_LOG(LOG_INFO, "yt-dlp %s is up to date", f.ytdlp_version);
+		bfree(latest);
+		return;
+	}
+
+	FETCH_LOG(LOG_INFO, "Updating yt-dlp %s -> %s", f.ytdlp_version ? f.ytdlp_version : "?", latest);
+	bfree(latest);
+	if (install_ytdlp()) {
+		f.ytdlp_ready = false; /* re-read the version */
+		f.ytdlp_failed = false;
+		ensure_ytdlp();
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -426,7 +510,79 @@ static void job_line(void *opaque, const char *line)
 	pthread_mutex_unlock(&f.mutex);
 }
 
-static bool run_job(const char *key, const char *url, int max_height, const char *final_path)
+/* Live streams are not downloaded: resolve their HLS URL instead. */
+static bool resolve_live(const char *key, const char *url, int max_height, struct dstr *stream_url)
+{
+	struct dstr fmt = {0}, out = {0};
+	bool ok = false;
+	dstr_printf(&fmt, "bv*[height<=%d]+ba/b[height<=%d]/b", max_height, max_height);
+	const char *argv[] = {f.ytdlp_path,
+			      "-q",
+			      "--no-warnings",
+			      "--no-playlist",
+			      "--match-filter",
+			      "is_live",
+			      "-f",
+			      fmt.array,
+			      "--print",
+			      "META\t%(duration)s\t%(title)s",
+			      "--print",
+			      "urls",
+			      "--",
+			      url,
+			      NULL};
+	if (yt_proc_run(argv, &out) == 0 && out.array) {
+		DARRAY(char *) urls;
+		da_init(urls);
+		char **lines = strlist_split(out.array, '\n', false);
+		for (char **line = lines; line && *line; line++) {
+			if (strncmp(*line, "META\t", 5) == 0) {
+				meta_from_fields(key, *line + 5);
+			} else if (yt_fetcher_is_remote(*line)) {
+				struct dstr u = {0};
+				dstr_copy(&u, *line);
+				dstr_depad(&u);
+				da_push_back(urls, &u.array);
+			}
+		}
+		strlist_free(lines);
+
+		if (urls.num == 1) {
+			dstr_copy(stream_url, urls.array[0]);
+			ok = true;
+		} else if (urls.num >= 2) {
+			/* YouTube serves live video and audio as separate HLS
+			 * playlists; media-playback opens a single input, so bind
+			 * them in a local master playlist (video variant + audio
+			 * rendition) that FFmpeg's HLS demuxer reads as one. */
+			struct dstr m3u8 = {0}, path = {0};
+			dstr_printf(&m3u8,
+				    "#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+				    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"audio\",DEFAULT=YES,"
+				    "AUTOSELECT=YES,URI=\"%s\"\n"
+				    "#EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO=\"aud\"\n%s\n",
+				    urls.array[1], urls.array[0]);
+			dstr_printf(&path, "%s/%s.live.m3u8", f.cache_dir, key);
+			os_mkdirs(f.cache_dir);
+			if (os_quick_write_utf8_file(path.array, m3u8.array, m3u8.len, false)) {
+				dstr_copy_dstr(stream_url, &path);
+				ok = true;
+			}
+			dstr_free(&m3u8);
+			dstr_free(&path);
+		}
+		for (size_t i = 0; i < urls.num; i++)
+			bfree(urls.array[i]);
+		da_free(urls);
+	}
+	/* not live: the caller reports the original download error */
+	dstr_free(&fmt);
+	dstr_free(&out);
+	return ok;
+}
+
+static bool run_job(const char *key, const char *url, int max_height, const char *final_path, bool *live,
+		    struct dstr *stream_url)
 {
 	struct dstr fmt = {0}, tmpl = {0}, out = {0}, part = {0}, err = {0};
 	DARRAY(char *) files;
@@ -484,10 +640,17 @@ static bool run_job(const char *key, const char *url, int max_height, const char
 	strlist_free(lines);
 
 	if (code != 0 || !files.num) {
-		if (code == 0)
-			FETCH_LOG(LOG_WARNING, "%s: nothing downloaded (live stream or unavailable)", url);
-		else
+		/* Live streams have no separate video/audio formats (the format
+		 * selection fails) or are skipped by "!is_live": check for one. */
+		if (!f.stop && resolve_live(key, url, max_height, stream_url)) {
+			FETCH_LOG(LOG_INFO, "%s: live stream, playing it directly", url);
+			*live = true;
+			ok = true;
+		} else if (code != 0) {
 			log_ytdlp_errors(url, out.array);
+		} else {
+			FETCH_LOG(LOG_WARNING, "%s: nothing downloaded (unavailable or upcoming)", url);
+		}
 		goto done;
 	}
 
@@ -823,6 +986,7 @@ static bool work_one_list(void)
 		} else if (l->state != YT_FETCH_READY) {
 			/* keep serving a previous (disk) copy if the refresh failed */
 			l->state = YT_FETCH_FAILED;
+			l->failed_ns = os_gettime_ns();
 			l->generation++;
 		}
 	}
@@ -900,6 +1064,7 @@ static void *worker(void *unused)
 
 	cache_remove_partials();
 	cache_evict();
+	check_ytdlp_update(false);
 
 	while (os_sem_wait(f.sem) == 0 && !f.stop) {
 		char *key = NULL, *url = NULL;
@@ -907,6 +1072,8 @@ static void *worker(void *unused)
 
 		if (os_atomic_exchange_bool(&f.evict_requested, false))
 			cache_evict();
+		if (os_atomic_exchange_bool(&f.update_requested, false))
+			check_ytdlp_update(true);
 
 		/* playlist expansion unblocks playback: always before downloads */
 		if (work_one_list()) {
@@ -934,9 +1101,11 @@ static void *worker(void *unused)
 		}
 
 		char *path = cache_file_for(key);
+		struct dstr stream_url = {0};
+		bool live = false;
 		FETCH_LOG(LOG_INFO, "Fetching %s", url);
-		bool ok = run_job(key, url, max_height, path);
-		if (ok)
+		bool ok = run_job(key, url, max_height, path, &live, &stream_url);
+		if (ok && !live)
 			FETCH_LOG(LOG_INFO, "Ready: %s -> %s", url, path);
 
 		pthread_mutex_lock(&f.mutex);
@@ -944,12 +1113,26 @@ static void *worker(void *unused)
 		if (e) {
 			e->running = false;
 			e->state = ok ? YT_FETCH_READY : YT_FETCH_FAILED;
-			if (ok) {
+			e->live = ok && live;
+			if (!ok)
+				e->failed_ns = os_gettime_ns();
+			bfree(e->path);
+			e->path = NULL;
+			if (ok && live) {
+				e->path = bstrdup(stream_url.array);
+				e->expires_ns = os_gettime_ns() + LIVE_URL_TTL_NS;
+			} else if (ok) {
 				e->path = path;
 				path = NULL;
 			}
 		}
 		pthread_mutex_unlock(&f.mutex);
+		dstr_free(&stream_url);
+
+		/* a broken extractor is the usual cause of failures: check for a
+		 * newer yt-dlp (at most daily unless forced) */
+		if (!ok && !f.stop)
+			check_ytdlp_update(false);
 
 		bfree(path);
 		bfree(key);
@@ -1025,6 +1208,7 @@ void yt_fetcher_free(void)
 	bfree(f.cache_dir);
 	bfree(f.bin_dir);
 	bfree(f.ytdlp_path);
+	bfree(f.ytdlp_version);
 }
 
 bool yt_fetcher_is_remote(const char *item)
@@ -1060,7 +1244,21 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 		e = da_push_back_new(f.entries);
 		*e = n;
 	}
-	if (e->state == YT_FETCH_READY && !os_file_exists(e->path)) {
+	uint64_t now_ns = os_gettime_ns();
+	bool requeue = false;
+	if (e->state == YT_FETCH_READY && e->live && now_ns > e->expires_ns)
+		requeue = true; /* stream URL about to expire */
+	if (e->state == YT_FETCH_FAILED && !e->running && now_ns - e->failed_ns > RETRY_FAILED_NS)
+		requeue = true; /* maybe it was a temporary network error */
+	if (requeue) {
+		bfree(e->path);
+		e->path = NULL;
+		e->live = false;
+		e->state = YT_FETCH_PENDING;
+		e->max_height = max_height;
+		os_sem_post(f.sem);
+	}
+	if (e->state == YT_FETCH_READY && !e->live && !os_file_exists(e->path)) {
 		/* evicted from the cache (or deleted by hand): fetch again */
 		bfree(e->path);
 		e->path = NULL;
@@ -1068,7 +1266,7 @@ enum yt_fetch_state yt_fetcher_request(const char *url, int max_height, char **p
 		e->max_height = max_height;
 		os_sem_post(f.sem);
 	}
-	if (e->state == YT_FETCH_READY) {
+	if (e->state == YT_FETCH_READY && !e->live) {
 		uint64_t now = os_gettime_ns();
 		if (!e->last_touch_ns || now - e->last_touch_ns > TOUCH_INTERVAL_NS) {
 			e->last_touch_ns = now;
@@ -1105,6 +1303,12 @@ bool yt_fetcher_is_collection(const char *url)
 		return false;
 	if (strstr(url, "list=") && !strstr(url, "v="))
 		return true;
+
+	/* ".../@name/live" is the channel's current live stream: one item */
+	const char *live = strstr(url, "/live");
+	if (live && (live[5] == 0 || live[5] == '?' || live[5] == '/'))
+		return false;
+
 	return strstr(url, "/@") || strstr(url, "/channel/") || strstr(url, "/c/") || strstr(url, "/user/");
 }
 
@@ -1136,6 +1340,9 @@ static struct list_entry *get_list_locked(const char *url)
 	} else if (l->state == YT_FETCH_READY && !l->running && !l->refresh && l->fetched_ns &&
 		   os_gettime_ns() - l->fetched_ns > LIST_REFRESH_NS) {
 		l->refresh = true;
+		os_sem_post(f.sem);
+	} else if (l->state == YT_FETCH_FAILED && !l->running && os_gettime_ns() - l->failed_ns > RETRY_FAILED_NS) {
+		l->state = YT_FETCH_PENDING;
 		os_sem_post(f.sem);
 	}
 	dstr_free(&key);
@@ -1198,6 +1405,7 @@ bool yt_fetcher_peek(const char *url, struct yt_item_info *info)
 		info->state = e->state;
 		info->running = e->running;
 		info->progress = e->progress;
+		info->live = e->live;
 	} else {
 		/* not requested this session, but maybe cached already */
 		char *cached = cache_file_for(key.array);
@@ -1219,4 +1427,11 @@ bool yt_fetcher_peek(const char *url, struct yt_item_info *info)
 
 	dstr_free(&key);
 	return info->known;
+}
+
+void yt_fetcher_update_ytdlp(void)
+{
+	os_atomic_set_bool(&f.update_requested, true);
+	if (f.thread_ok)
+		os_sem_post(f.sem);
 }

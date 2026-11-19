@@ -103,6 +103,7 @@ struct yt_source {
 	bool emit_ended;   /* signal media_ended + clear video */
 	size_t waiting_for; /* index whose download we are waiting on (log once) */
 	bool waiting;       /* nothing playing: waiting for a download */
+	float error_t;      /* seconds spent in OBS_MEDIA_STATE_ERROR */
 	bool emit_clear;    /* clear the video while waiting */
 };
 
@@ -348,8 +349,17 @@ static void yt_stop_cb(void *opaque)
 /* ------------------------------------------------------------------------- */
 /* player creation / destruction                                             */
 
+static bool is_stream_path(const char *path)
+{
+	size_t n = path ? strlen(path) : 0;
+	return yt_fetcher_is_remote(path) || (n > 5 && strcmp(path + n - 5, ".m3u8") == 0);
+}
+
 static struct yt_player *open_player_locked(struct yt_source *s, size_t index, const char *path)
 {
+	bool is_stream = is_stream_path(path);
+	/* the local master playlist references https playlists */
+	static char hls_opts[] = "protocol_whitelist=file,http,https,tcp,tls,crypto";
 	struct yt_player *p = bzalloc(sizeof(*p));
 	p->s = s;
 	p->index = index;
@@ -364,7 +374,11 @@ static struct yt_player *open_player_locked(struct yt_source *s, size_t index, c
 		.speed = 100,
 		.force_range = VIDEO_RANGE_DEFAULT,
 		.hardware_decoding = s->hw_decode,
-		.is_local_file = true,
+		/* live streams arrive as stream URLs or a local HLS master
+		 * playlist pointing at remote playlists; everything else is a file */
+		.is_local_file = !is_stream,
+		.buffering = is_stream ? 2 * 1024 * 1024 : 0,
+		.ffmpeg_options = is_stream ? hls_opts : NULL,
 	};
 
 	p->mp = media_playback_create(&info);
@@ -454,6 +468,9 @@ static void fill_slots_locked(struct yt_source *s)
 		if (res == ITEM_PENDING) {
 			/* poll again next tick; the current item keeps playing */
 			s->pending = true;
+		} else if (res == ITEM_READY && is_stream_path(path)) {
+			/* live stream: opening it early would start it behind the live
+			 * edge (and its segments may expire); open it when it is due */
 		} else {
 			s->next_index = successor_locked(s, index);
 			struct yt_player *p = res == ITEM_READY ? open_player_locked(s, index, path) : NULL;
@@ -494,6 +511,18 @@ static void yt_tick(void *data, float seconds)
 	bool started, ended, clear;
 
 	pthread_mutex_lock(&s->mutex);
+	if (s->state == OBS_MEDIA_STATE_ERROR && s->items.num) {
+		/* every item failed (network down?): try again every 30 s; failed
+		 * downloads are retried by the fetcher after a while */
+		s->error_t += seconds;
+		if (s->error_t >= 30.0f) {
+			s->error_t = 0.0f;
+			YT_LOG(LOG_INFO, "Retrying the playlist after errors");
+			start_at_locked(s, 0);
+		}
+	} else {
+		s->error_t = 0.0f;
+	}
 	if (s->has_lists) {
 		s->list_check_t += seconds;
 		if (s->list_check_t >= 0.5f) {
@@ -554,6 +583,15 @@ static void yt_defaults(obs_data_t *settings)
 
 static bool refresh_lists_clicked(obs_properties_t *props, obs_property_t *prop, void *data);
 
+static bool update_ytdlp_clicked(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+	UNUSED_PARAMETER(data);
+	yt_fetcher_update_ytdlp();
+	return false;
+}
+
 static obs_properties_t *yt_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
@@ -580,6 +618,7 @@ static obs_properties_t *yt_properties(void *data)
 	obs_property_set_long_description(w, T_("ClearOnWait.Description"));
 	obs_property_t *c = obs_properties_add_int(props, S_CACHE_LIMIT, T_("CacheLimit"), 1, 2000, 1);
 	obs_property_int_set_suffix(c, " GB");
+	obs_properties_add_button2(props, "update_ytdlp", T_("UpdateYtdlp"), update_ytdlp_clicked, NULL);
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	return props;
 }
@@ -841,7 +880,7 @@ static void proc_get_queue(void *data, calldata_t *cd)
 			obs_data_set_int(item, "duration", info.duration);
 			if (info.known) {
 				if (info.state == YT_FETCH_READY)
-					status = "ready";
+					status = info.live ? "live" : "ready";
 				else if (info.state == YT_FETCH_FAILED)
 					status = "failed";
 				else if (info.running)

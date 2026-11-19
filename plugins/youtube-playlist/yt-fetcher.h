@@ -54,6 +54,10 @@ struct yt_item_info {
 	int progress; /* 0-100 while running */
 	char title[256];
 	int duration; /* seconds, 0 = unknown */
+	bool live;    /* a live stream (played directly, not cached) */
 };
 
 bool yt_fetcher_peek(const char *url, struct yt_item_info *info);
+
+/* Check for a newer yt-dlp now and install it (background). */
+void yt_fetcher_update_ytdlp(void);
