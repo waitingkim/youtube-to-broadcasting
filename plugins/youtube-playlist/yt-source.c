@@ -26,9 +26,12 @@
 #include <string.h>
 #include <media-playback/media-playback.h>
 
+#include "yt-fetcher.h"
+
 #define S_PLAYLIST "playlist"
 #define S_LOOP "loop"
 #define S_HW_DECODE "hw_decode"
+#define S_MAX_HEIGHT "max_height"
 
 #define T_(text) obs_module_text(text)
 
@@ -56,6 +59,7 @@ struct yt_source {
 	DARRAY(char *) items;
 	bool loop;
 	bool hw_decode;
+	int max_height;
 
 	/* playback */
 	struct yt_player *slots[2];
@@ -70,7 +74,46 @@ struct yt_source {
 	bool need_start;   /* open next_index as the current player */
 	bool emit_started; /* signal media_started */
 	bool emit_ended;   /* signal media_ended + clear video */
+	size_t waiting_for; /* index whose download we are waiting on (log once) */
 };
+
+enum item_res {
+	ITEM_READY,
+	ITEM_PENDING,
+	ITEM_FAILED,
+};
+
+/* Map a playlist item to a playable local path.  Remote items are handed to
+ * the fetcher (non-blocking); *path is set only when ITEM_READY. */
+static enum item_res resolve_item_locked(struct yt_source *s, size_t index, char **path)
+{
+	const char *item = s->items.array[index];
+	*path = NULL;
+
+	if (!yt_fetcher_is_remote(item)) {
+		*path = bstrdup(item);
+		return ITEM_READY;
+	}
+
+	switch (yt_fetcher_request(item, s->max_height, path)) {
+	case YT_FETCH_READY:
+		return ITEM_READY;
+	case YT_FETCH_FAILED:
+		return ITEM_FAILED;
+	default:
+		return ITEM_PENDING;
+	}
+}
+
+/* Queue downloads for an item without using the result. */
+static void prefetch_locked(struct yt_source *s, size_t index)
+{
+	if (index == NO_INDEX || index >= s->items.num || !yt_fetcher_is_remote(s->items.array[index]))
+		return;
+	char *path = NULL;
+	yt_fetcher_request(s->items.array[index], s->max_height, &path);
+	bfree(path);
+}
 
 /* ------------------------------------------------------------------------- */
 /* helpers (call with s->mutex held)                                         */
@@ -166,6 +209,7 @@ static void start_at_locked(struct yt_source *s, size_t index)
 	s->next_index = index;
 	s->need_start = true;
 	s->fail_streak = 0;
+	s->waiting_for = NO_INDEX;
 	s->pending = true;
 }
 
@@ -231,7 +275,7 @@ static void yt_stop_cb(void *opaque)
 /* ------------------------------------------------------------------------- */
 /* player creation / destruction                                             */
 
-static struct yt_player *open_player_locked(struct yt_source *s, size_t index)
+static struct yt_player *open_player_locked(struct yt_source *s, size_t index, const char *path)
 {
 	struct yt_player *p = bzalloc(sizeof(*p));
 	p->s = s;
@@ -243,7 +287,7 @@ static struct yt_player *open_player_locked(struct yt_source *s, size_t index)
 		.v_seek_cb = yt_seek_cb,
 		.a_cb = yt_audio_cb,
 		.stop_cb = yt_stop_cb,
-		.path = s->items.array[index],
+		.path = path,
 		.speed = 100,
 		.force_range = VIDEO_RANGE_DEFAULT,
 		.hardware_decoding = s->hw_decode,
@@ -288,10 +332,29 @@ static void fill_slots_locked(struct yt_source *s)
 			return;
 
 		size_t index = s->next_index;
+		char *path = NULL;
+		enum item_res res = resolve_item_locked(s, index, &path);
+
+		if (res == ITEM_PENDING) {
+			/* keep polling from yt_tick until the download finishes */
+			if (s->waiting_for != index) {
+				s->waiting_for = index;
+				YT_LOG(LOG_INFO, "Waiting for download of item %zu: %s", index + 1,
+				       s->items.array[index]);
+			}
+			prefetch_locked(s, successor_locked(s, index));
+			s->pending = true;
+			return;
+		}
+		s->waiting_for = NO_INDEX;
 		s->next_index = successor_locked(s, index);
 
-		struct yt_player *p = open_player_locked(s, index);
+		struct yt_player *p = res == ITEM_READY ? open_player_locked(s, index, path) : NULL;
+		bfree(path);
 		if (!p) {
+			if (res == ITEM_FAILED)
+				YT_LOG(LOG_WARNING, "Item %zu could not be fetched, skipping: %s", index + 1,
+				       s->items.array[index]);
 			s->fail_streak++;
 			s->pending = true; /* retry with the following item */
 			if (s->next_index == NO_INDEX) {
@@ -310,16 +373,31 @@ static void fill_slots_locked(struct yt_source *s)
 	/* preload the following item */
 	if (s->cur >= 0 && !s->slots[1 - s->cur] && s->next_index != NO_INDEX) {
 		size_t index = s->next_index;
-		s->next_index = successor_locked(s, index);
+		char *path = NULL;
+		enum item_res res = resolve_item_locked(s, index, &path);
 
-		struct yt_player *p = open_player_locked(s, index);
-		if (p) {
-			s->slots[1 - s->cur] = p;
-		} else {
-			s->fail_streak++;
+		if (res == ITEM_PENDING) {
+			/* poll again next tick; the current item keeps playing */
 			s->pending = true;
+		} else {
+			s->next_index = successor_locked(s, index);
+			struct yt_player *p = res == ITEM_READY ? open_player_locked(s, index, path) : NULL;
+			if (p) {
+				s->slots[1 - s->cur] = p;
+			} else {
+				if (res == ITEM_FAILED)
+					YT_LOG(LOG_WARNING, "Item %zu could not be fetched, skipping: %s", index + 1,
+					       s->items.array[index]);
+				s->fail_streak++;
+				s->pending = true;
+			}
 		}
+		bfree(path);
 	}
+
+	/* keep the download queue one item ahead of the preload */
+	if (s->cur >= 0)
+		prefetch_locked(s, s->next_index);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -379,6 +457,7 @@ static void yt_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_bool(settings, S_LOOP, true);
 	obs_data_set_default_bool(settings, S_HW_DECODE, true);
+	obs_data_set_default_int(settings, S_MAX_HEIGHT, 1080);
 }
 
 static obs_properties_t *yt_properties(void *data)
@@ -386,10 +465,19 @@ static obs_properties_t *yt_properties(void *data)
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 
-	obs_properties_add_editable_list(props, S_PLAYLIST, T_("Playlist"), OBS_EDITABLE_LIST_TYPE_FILES,
+	obs_properties_add_editable_list(props, S_PLAYLIST, T_("Playlist"), OBS_EDITABLE_LIST_TYPE_FILES_AND_URLS,
 					 "Media Files (*.mp4 *.m4v *.mov *.mkv *.webm *.ts *.flv);;All Files (*.*)",
 					 NULL);
 	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
+
+	obs_property_t *h = obs_properties_add_list(props, S_MAX_HEIGHT, T_("MaxHeight"), OBS_COMBO_TYPE_LIST,
+						    OBS_COMBO_FORMAT_INT);
+	static const int heights[] = {360, 480, 720, 1080, 1440, 2160};
+	for (size_t i = 0; i < sizeof(heights) / sizeof(heights[0]); i++) {
+		char name[16];
+		snprintf(name, sizeof(name), "%dp", heights[i]);
+		obs_property_list_add_int(h, name, heights[i]);
+	}
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	return props;
 }
@@ -427,6 +515,9 @@ static void yt_update(void *data, obs_data_t *settings)
 	bool hw_changed = s->hw_decode != obs_data_get_bool(settings, S_HW_DECODE);
 	s->loop = obs_data_get_bool(settings, S_LOOP);
 	s->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
+	s->max_height = (int)obs_data_get_int(settings, S_MAX_HEIGHT);
+	if (s->max_height <= 0)
+		s->max_height = 1080;
 
 	if (was_running) {
 		if (hw_changed || !s->items.num) {
@@ -476,6 +567,7 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	s->cur = -1;
 	s->state = OBS_MEDIA_STATE_NONE;
 	s->next_index = NO_INDEX;
+	s->waiting_for = NO_INDEX;
 	pthread_mutex_init(&s->mutex, NULL);
 	da_init(s->items);
 

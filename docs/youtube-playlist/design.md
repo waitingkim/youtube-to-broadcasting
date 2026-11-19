@@ -130,12 +130,24 @@ frontend/utility/YoutubeApiWrappers.*   # 플레이리스트 API 추가
 |---|---|---|
 | M0 | OBS 소스 macOS 빌드 | 직접 빌드한 OBS로 RTMP 송출 성공 |
 | M1 ✅ | 플러그인 뼈대 | 로컬 파일 목록을 A/B 플레이어로 끊김 없이 연속 재생 |
-| M2 | yt-dlp 연동 | 단일 YouTube URL 다운로드 → 재생 |
+| M2 ✅ | yt-dlp 연동 | 단일 YouTube URL 다운로드 → 재생 |
 | M3 | 큐 + 선행 다운로드 | 여러 URL 연속 재생, 다음 항목 사전 준비, 오류 항목 skip |
 | M4 | 공개 재생목록 | 재생목록 URL → 큐 일괄 등록 |
 | M5 | Dock UI | 큐 편집/컨트롤/상태 표시 |
 | M6 | 개인 플레이리스트 | OAuth 로그인 → 내 플레이리스트 가져오기 |
 | M7 | 안정화 | 라이브 URL, 캐시 LRU, yt-dlp 업데이트, 24시간 연속 송출 테스트 |
+
+## 5.1 M2 구현 메모
+- **yt-dlp는 플러그인 전용 실행 파일**: 첫 사용 시 `plugin_config/youtube-playlist/bin/`에 자동 설치.
+  GitHub 릴리스의 `SHA2-256SUMS`로 SHA-256 검증 후 설치. 시스템 PATH의 yt-dlp는 사용하지 않음.
+- **macOS는 one-dir 빌드(`yt-dlp_macos.zip`) 사용**: one-file 빌드는 실행마다 자체 압축 해제 +
+  macOS 보안 검사로 매회 ~9초 지연. one-dir은 최초 1회만 검사, 이후 실행 ~0.2초.
+- **ffmpeg CLI 불필요**: 영상/오디오를 따로 받은 뒤(`-f "bv*...,ba..."`) 플러그인 안에서
+  libavformat으로 MKV remux (`yt-remux.c`, 재인코딩 없음).
+- **취소 가능한 프로세스 실행**(`yt-proc.c`): OBS 종료 시 실행 중인 yt-dlp를 SIGTERM으로 즉시 종료.
+- 캐시: `plugin_config/youtube-playlist/cache/<key>.mkv` (key = `yt-<videoId>` 또는 URL 해시).
+- 라이브 영상은 현재 `--match-filter !is_live`로 제외 → 실패 처리 (M7에서 HLS 직접 재생 예정).
+- JS 런타임(deno) 미설치 경고가 나오지만 현재 1080p H.264까지 정상 다운로드됨.
 
 ## 6. 미결 사항
 1. ~~레포 운영 방식~~ → 포크로 결정 (§0)
