@@ -68,6 +68,8 @@ struct yt_source {
 	DARRAY(char *) raw;   /* entries as entered by the user */
 	DARRAY(char *) items; /* playable entries (playlists expanded) */
 	DARRAY(uint32_t) list_gens; /* per raw entry: list generation used (0 = n/a) */
+	DARRAY(size_t) raw_pos;     /* per raw entry: index in the settings array */
+	DARRAY(size_t) item_raw;    /* per item: raw entry it came from */
 	bool has_lists;
 	bool lists_pending; /* some playlist is still being expanded */
 	float list_check_t;
@@ -587,6 +589,7 @@ static void free_items(struct yt_source *s)
 	for (size_t i = 0; i < s->items.num; i++)
 		bfree(s->items.array[i]);
 	da_free(s->items);
+	da_free(s->item_raw);
 }
 
 static void free_raw(struct yt_source *s)
@@ -595,6 +598,7 @@ static void free_raw(struct yt_source *s)
 		bfree(s->raw.array[i]);
 	da_free(s->raw);
 	da_free(s->list_gens);
+	da_free(s->raw_pos);
 }
 
 /* Rebuild s->items from s->raw, expanding playlists/channels that the
@@ -614,6 +618,7 @@ static void expand_items_locked(struct yt_source *s)
 		if (!yt_fetcher_is_collection(entry)) {
 			char *copy = bstrdup(entry);
 			da_push_back(s->items, &copy);
+			da_push_back(s->item_raw, &i);
 			continue;
 		}
 
@@ -627,6 +632,7 @@ static void expand_items_locked(struct yt_source *s)
 			for (char **u = urls; u && *u; u++) {
 				char *copy = bstrdup(*u);
 				da_push_back(s->items, &copy);
+				da_push_back(s->item_raw, &i);
 			}
 		} else if (st == YT_FETCH_FAILED) {
 			YT_LOG(LOG_WARNING, "Playlist could not be loaded: %s", entry);
@@ -705,6 +711,7 @@ static void yt_update(void *data, obs_data_t *settings)
 		if (path && *path) {
 			char *copy = bstrdup(path);
 			da_push_back(s->raw, &copy);
+			da_push_back(s->raw_pos, &i);
 		}
 		obs_data_release(item);
 	}
@@ -807,11 +814,20 @@ static void proc_get_queue(void *data, calldata_t *cd)
 	obs_data_set_string(root, "state", state_name(st));
 	obs_data_set_int(root, "current", s->cur >= 0 ? (long long)s->cur_index : -1);
 	obs_data_set_bool(root, "lists_pending", s->lists_pending);
+	obs_data_set_bool(root, "loop", s->loop);
 
 	for (size_t i = 0; i < s->items.num; i++) {
 		const char *entry = s->items.array[i];
 		obs_data_t *item = obs_data_create();
 		obs_data_set_string(item, "entry", entry);
+		size_t raw = i < s->item_raw.num ? s->item_raw.array[i] : 0;
+		if (raw < s->raw.num) {
+			/* index into settings["playlist"] of the entry this item
+			 * comes from, and whether that entry is a playlist/channel */
+			obs_data_set_int(item, "setting_index", (long long)s->raw_pos.array[raw]);
+			obs_data_set_bool(item, "from_list", yt_fetcher_is_collection(s->raw.array[raw]));
+			obs_data_set_string(item, "list", s->raw.array[raw]);
+		}
 
 		const char *status = "";
 		if (!yt_fetcher_is_remote(entry)) {
@@ -884,6 +900,8 @@ static void *yt_create(obs_data_t *settings, obs_source_t *source)
 	da_init(s->items);
 	da_init(s->raw);
 	da_init(s->list_gens);
+	da_init(s->raw_pos);
+	da_init(s->item_raw);
 
 	const char *resume_item = obs_data_get_string(settings, S_RESUME_ITEM);
 	if (resume_item && *resume_item) {

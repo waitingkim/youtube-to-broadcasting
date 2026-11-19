@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -32,12 +33,24 @@ private slots:
 	void AddEntry();
 	void RefreshLists();
 	void ItemActivated(QTreeWidgetItem *item, int column);
+	void ShowContextMenu(const QPoint &pos);
+	void MoveUp();
+	void MoveDown();
+	void RemoveSelected();
+	void LoopToggled(bool checked);
+	void SelectionChanged();
 
 private:
 	void UpdateSourceList();
 	void UpdateQueue();
 	void UpdateNowPlaying();
 	QString SelectedSource() const;
+
+	/* queue editing works on entries of the source's "playlist" setting;
+	 * items expanded from a playlist/channel map to that one entry */
+	void MoveEntry(int settingIndex, int delta);
+	void RemoveEntry(int settingIndex);
+	void PlayItem(QTreeWidgetItem *item);
 
 	QComboBox *sourceCombo;
 	QLabel *nowTitle;
@@ -50,9 +63,14 @@ private:
 	QLineEdit *entryEdit;
 	QPushButton *addButton;
 	QPushButton *refreshListsButton;
+	QPushButton *upButton;
+	QPushButton *downButton;
+	QPushButton *removeButton;
+	QCheckBox *loopCheck;
 	QTreeWidget *queue;
 	QTimer *timer;
 
 	QStringList shownEntries; /* entries currently in the tree */
+	QString selectEntry;      /* re-select this entry after the next rebuild */
 	QString currentTitle;
 };
